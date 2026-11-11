@@ -8,6 +8,8 @@ SmartPack 3D — 간단한 3D 자동 정리 프로토타입
 - 큰 물건부터, 튼튼한 물건을 먼저 넣고 깨짐/눌림 주의 물건은 나중에(위쪽에) 넣습니다.
 - 물건은 아래에서 충분히 받쳐져야 하며(지지 검사), 각 물건이 버틸 수 있는 무게를 넘지 않게 쌓습니다.
 - 방향 고정(세우기 고정/완전 고정)을 지원합니다.
+- 빈틈 줄이기: 투영 극점(Projected Extreme Point)으로 틈 안쪽 자리까지 후보로 만들고,
+  벽·바닥·다른 물건과 맞닿는 면적이 넓은 자리를 우선해 붙여 넣습니다.
 """
 
 import math
@@ -18,6 +20,12 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+def placement_score(x, y, z, w, d, h, leftover, contact):
+    """값이 작을수록 좋은 자리."""
+    # 맞닿는 면적이 넓은 자리 우선 → 같으면 낮은 자리 → 남는 공간이 적은 자리
+    return (-round(contact, 6), z, leftover, y, x)
+
 
 # 물건 바닥 면적 중 이 비율 이상이 아래 물건(또는 바닥)에 닿아 있어야 놓을 수 있습니다.
 SUPPORT_RATIO = 0.7
@@ -91,17 +99,74 @@ def inside_bin(p: PlacedItem, bw: float, bd: float, bh: float) -> bool:
     )
 
 
+def _project(px: float, py: float, pz: float, axis: int, placed: List[PlacedItem]) -> float:
+    """점 (px, py, pz)를 axis 방향(0=x, 1=y, 2=z)으로 원점 쪽으로 밀었을 때 처음 닿는 좌표.
+    벽(0) 또는 그 방향에 있는 물건의 면에서 멈춥니다."""
+    pos = (px, py, pz)
+    stop = 0.0
+    for q in placed:
+        lo = (q.x, q.y, q.z)
+        hi = (q.x + q.width, q.y + q.depth, q.z + q.height)
+        # 나머지 두 축에서 점이 물건의 면 범위 안에 있어야 부딪힘
+        if all(lo[k] - 1e-9 <= pos[k] < hi[k] - 1e-9 for k in range(3) if k != axis):
+            if hi[axis] <= pos[axis] + 1e-9:
+                stop = max(stop, hi[axis])
+    return stop
+
+
 def candidate_positions(placed: List[PlacedItem]) -> List[Tuple[float, float, float]]:
-    """물건 모서리에서 새 배치를 시도하는 단순한 극점 후보 생성."""
+    """투영 극점(Projected Extreme Point) 후보 생성.
+    놓인 물건의 세 모서리 점(오른쪽·뒤쪽·위쪽)을 만들고, 각 점을 나머지 두 방향으로
+    벽이나 다른 물건에 닿을 때까지 밀어서 틈 안쪽 자리까지 후보로 만듭니다."""
     points = {(0.0, 0.0, 0.0)}
     for p in placed:
-        points.add((p.x + p.width, p.y, p.z))
-        points.add((p.x, p.y + p.depth, p.z))
-        points.add((p.x, p.y, p.z + p.height))
-        points.add((p.x + p.width, p.y + p.depth, p.z))
-        points.add((p.x + p.width, p.y, p.z + p.height))
-        points.add((p.x, p.y + p.depth, p.z + p.height))
+        corners = [
+            ((p.x + p.width, p.y, p.z), 0),   # 오른쪽 모서리 → y, z 방향으로 투영
+            ((p.x, p.y + p.depth, p.z), 1),   # 뒤쪽 모서리 → x, z 방향으로 투영
+            ((p.x, p.y, p.z + p.height), 2),  # 위쪽 모서리 → x, y 방향으로 투영
+        ]
+        for (cx, cy, cz), own in corners:
+            points.add((cx, cy, cz))
+            for axis in range(3):
+                if axis == own:
+                    continue
+                pt = [cx, cy, cz]
+                pt[axis] = _project(cx, cy, cz, axis, placed)
+                points.add(tuple(pt))
     return sorted(points, key=lambda q: (q[2], q[1], q[0]))
+
+
+def contact_ratio(c: PlacedItem, placed: List[PlacedItem], bw: float, bd: float, bh: float) -> float:
+    """후보 물건의 겉면 중 벽·바닥·다른 물건과 맞닿는 면적의 비율(0~1)."""
+    w, d, h = c.width, c.depth, c.height
+    total = 2 * (w * d + w * h + d * h)
+    touch = 0.0
+    # 수납함 벽과 바닥 (뚜껑 쪽 윗면은 제외)
+    if c.x < 1e-6:
+        touch += d * h
+    if abs(c.x + w - bw) < 1e-6:
+        touch += d * h
+    if c.y < 1e-6:
+        touch += w * h
+    if abs(c.y + d - bd) < 1e-6:
+        touch += w * h
+    if c.z < 1e-6:
+        touch += w * d
+
+    def span(a0, a1, b0, b1):
+        return max(0.0, min(a1, b1) - max(a0, b0))
+
+    for q in placed:
+        ox = span(c.x, c.x + w, q.x, q.x + q.width)
+        oy = span(c.y, c.y + d, q.y, q.y + q.depth)
+        oz = span(c.z, c.z + h, q.z, q.z + q.height)
+        if abs(c.x - (q.x + q.width)) < 1e-6 or abs(c.x + w - q.x) < 1e-6:
+            touch += oy * oz
+        if abs(c.y - (q.y + q.depth)) < 1e-6 or abs(c.y + d - q.y) < 1e-6:
+            touch += ox * oz
+        if abs(c.z - (q.z + q.height)) < 1e-6 or abs(c.z + h - q.z) < 1e-6:
+            touch += ox * oy
+    return touch / total if total else 0.0
 
 
 def orientations(item: Item) -> List[Tuple[float, float, float]]:
@@ -162,11 +227,12 @@ def find_position(
     best = None
     best_score = None
 
+    points = candidate_positions(placed)  # 방향마다 다시 계산하지 않도록 한 번만 생성
     for w, d, h in orientations(item):
         if w > bw or d > bd or h > bh:
             continue
 
-        for x, y, z in candidate_positions(placed):
+        for x, y, z in points:
             candidate = PlacedItem(item, x, y, z, w, d, h)
             if not inside_bin(candidate, bw, bd, bh):
                 continue
@@ -185,7 +251,8 @@ def find_position(
                 + (bd - (y + d)) * w * h
                 + (bh - (z + h)) * w * d
             )
-            score = (z, leftover, y, x)
+            contact = contact_ratio(candidate, placed, bw, bd, bh)
+            score = placement_score(x, y, z, w, d, h, leftover, contact)
             if best_score is None or score < best_score:
                 best_score = score
                 best = (candidate, loads)
