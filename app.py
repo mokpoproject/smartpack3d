@@ -16,6 +16,7 @@ app.py - SmartPack 3D Streamlit UI (표현 계층)
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional, Tuple
 
 import cv2
@@ -30,9 +31,13 @@ from packing import (
 )
 from plot3d import make_figure
 from vision import (
-    ARUCO_DICTS, ItemEstimate, MarkerDetector, ObjectMeasurer,
-    PhotoMeasurement, SizeEstimator, decode_image,
+    ARUCO_DICTS, CARD_H_CM, CARD_W_CM, DEFAULT_MARKER_CM, REF_CARD, REF_MARKER,
+    ItemEstimate, MarkerDetector, ObjectMeasurer, PhotoMeasurement, SizeEstimator, decode_image,
 )
+
+MARKER_PDF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "markers", "aruco_id7_6cm_A4.pdf")
+MODE_MARKER = "ArUco 마커 (정밀)"
+MODE_CARD = "체크카드 (간편)"
 
 # 모바일에서는 사이드바가 자동으로 접히도록 'auto'로 둡니다.
 st.set_page_config(page_title="SmartPack 3D", page_icon="📦", layout="wide", initial_sidebar_state="auto")
@@ -165,9 +170,9 @@ def photo_input(label: str, key: str) -> Optional[bytes]:
     return up.getvalue() if up is not None else None
 
 
-def roi_input(key: str) -> Optional[Tuple[float, float, float, float]]:
-    """배경이 복잡할 때 물건 영역을 사각형으로 지정합니다(선택)."""
-    if not st.checkbox("물건 영역 직접 지정 (배경이 복잡할 때)", key=f"{key}_roi_on"):
+def roi_input(key: str, label: str = "물건 영역 직접 지정 (배경이 복잡할 때)") -> Optional[Tuple[float, float, float, float]]:
+    """배경이 복잡할 때 물건(또는 카드) 영역을 사각형으로 지정합니다(선택)."""
+    if not st.checkbox(label, key=f"{key}_roi_on"):
         return None
     c1, c2 = st.columns(2)
     x = c1.slider("좌우 범위 (%)", 0, 100, (5, 95), key=f"{key}_rx")
@@ -176,28 +181,31 @@ def roi_input(key: str) -> Optional[Tuple[float, float, float, float]]:
 
 
 def measure_photo(measurer: ObjectMeasurer, data: bytes, marker_cm: float, view: str,
-                  roi: Optional[Tuple[float, float, float, float]]) -> Tuple[PhotoMeasurement, Optional[np.ndarray]]:
+                  roi: Optional[Tuple[float, float, float, float]], reference: str = REF_MARKER,
+                  card_roi: Optional[Tuple[float, float, float, float]] = None,
+                  ) -> Tuple[PhotoMeasurement, Optional[np.ndarray]]:
     """사진 bytes를 디코딩해 측정합니다. 디코딩 오류도 실패 결과로 바꿉니다."""
     try:
         img = decode_image(data)
     except ValueError as e:
-        return PhotoMeasurement.failed(str(e)), None
+        return PhotoMeasurement.failed(str(e), reference=reference), None
     if view == "top":
-        return measurer.measure_top(img, marker_cm, roi=roi), img
-    return measurer.measure_side(img, marker_cm, roi=roi), img
+        return measurer.measure_top(img, marker_cm, roi=roi, reference=reference, card_roi=card_roi), img
+    return measurer.measure_side(img, marker_cm, roi=roi, reference=reference, card_roi=card_roi), img
 
 
 def run_estimation(target_idx: int, target_name: str, marker_cm: float, dict_name: str,
                    top_bytes: Optional[bytes], side_bytes: Optional[bytes],
-                   roi_top, roi_side) -> None:
+                   roi_top, roi_side, reference: str = REF_MARKER,
+                   card_roi_top=None, card_roi_side=None) -> None:
     """사진 측정 -> 결과 통합 -> LLM 보조 판정을 수행하고 결과를 세션에 저장합니다."""
     measurer = get_measurer(dict_name)
     top = side = None
     top_img = None
     if top_bytes is not None:
-        top, top_img = measure_photo(measurer, top_bytes, marker_cm, "top", roi_top)
+        top, top_img = measure_photo(measurer, top_bytes, marker_cm, "top", roi_top, reference, card_roi_top)
     if side_bytes is not None:
-        side, _ = measure_photo(measurer, side_bytes, marker_cm, "side", roi_side)
+        side, _ = measure_photo(measurer, side_bytes, marker_cm, "side", roi_side, reference, card_roi_side)
 
     est: ItemEstimate = SizeEstimator().combine(top, side) if top is not None else ItemEstimate(
         errors=["가로·깊이 측정 사진(상면)을 업로드해 주세요."])
@@ -247,11 +255,17 @@ def show_estimate_result() -> None:
     st.markdown(f"**추정 대상:** {res['name']} (표 {res['idx'] + 1}행)")
 
     marker_txt = []
+    ref_label = "ArUco 마커"
     for label, m in (("상면", top), ("측면", side)):
         if m is not None:
-            marker_txt.append(f"{label}: {'감지됨 (ID ' + str(m.marker_id) + ')' if m.marker_found else '미감지'}")
+            if m.reference == REF_CARD:
+                ref_label = f"체크카드 ({CARD_W_CM} × {CARD_H_CM:.2f} cm)"
+                found = "감지됨" if m.marker_found else "미감지"
+            else:
+                found = f"감지됨 (ID {m.marker_id})" if m.marker_found else "미감지"
+            marker_txt.append(f"{label}: {found}")
     if marker_txt:
-        st.caption("ArUco 마커 · " + " / ".join(marker_txt))
+        st.caption(f"기준 물체: {ref_label} · " + " / ".join(marker_txt))
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("가로 (cm)", "-" if est.width is None else f"{est.width:.1f}")
@@ -270,7 +284,7 @@ def show_estimate_result() -> None:
         cols = st.columns(len(previews))
         for col, (lbl, m) in zip(cols, previews):
             col.image(cv2.cvtColor(m.preview_bgr, cv2.COLOR_BGR2RGB), caption=lbl, width="stretch")
-        st.caption("초록: 마커 / 빨강: 물건 윤곽 / 파랑: 물건 최소 사각형. 윤곽이 물건과 다르면 영역을 직접 지정해 주세요.")
+        st.caption("초록: 기준 물체(마커·카드) / 빨강: 물건 윤곽 / 파랑: 물건 최소 사각형. 윤곽이 다르면 영역을 직접 지정해 주세요.")
 
     st.markdown("**AI 보조 판정** (치수 아님, 참고용)")
     if advice.available:
@@ -305,12 +319,26 @@ def show_estimate_result() -> None:
 
 with tab_photo:
     st.subheader("2. 사진으로 크기 추정")
-    st.markdown(
-        "**준비:** 크기를 아는 ArUco 마커(인쇄물)를 준비하고 **물건과 같은 평면**에 놓으세요.\n\n"
-        "- **① 상면 사진 (가로·깊이):** 바닥에 물건과 마커를 놓고 **위에서 수직으로** 찍습니다.\n"
-        "- **② 측면 사진 (높이, 선택):** 물건과 마커를 **옆에서** 찍습니다. 마커는 똑바로 세우세요.\n"
-        "- 마커는 흐리지 않게, 가능한 한 크게 찍으세요."
+    mode = st.radio(
+        "크기 기준", [MODE_CARD, MODE_MARKER], horizontal=True, key="ref_mode",
+        help="사진 한 장에는 거리 정보가 없어서, 크기를 아는 물체를 함께 찍어야 cm를 계산할 수 있습니다.",
     )
+    reference = REF_CARD if mode == MODE_CARD else REF_MARKER
+    ref_word = "체크카드" if reference == REF_CARD else "마커"
+    if reference == REF_CARD:
+        st.markdown(
+            "**준비:** 지갑에 있는 **체크카드·신용카드·학생증**(모두 8.56 × 5.40cm 규격)을 물건 **바로 옆**에 놓으세요.\n\n"
+            "- **① 상면 사진 (가로·깊이):** 바닥에 물건과 카드를 놓고 **위에서 수직으로** 찍습니다.\n"
+            "- **② 측면 사진 (높이, 선택):** 카드를 물건 옆에 **가로로 세워** 옆에서 찍습니다.\n"
+            "- 카드와 **색이 다른 바닥** 위에서 찍고, 카드 네 모서리가 모두 보이게 하세요. 카드 번호 면은 가려도 됩니다."
+        )
+    else:
+        st.markdown(
+            "**준비:** 아래 마커 파일을 **배율 100%**로 인쇄해 물건 **바로 옆, 같은 평면**에 놓으세요.\n\n"
+            "- **① 상면 사진 (가로·깊이):** 바닥에 물건과 마커를 놓고 **위에서 수직으로** 찍습니다.\n"
+            "- **② 측면 사진 (높이, 선택):** 물건과 마커를 **옆에서** 찍습니다. 마커는 똑바로 세우세요.\n"
+            "- 마커는 흐리지 않게, 가능한 한 크게 찍으세요."
+        )
 
     if st.session_state.get("last_edited") is None or len(st.session_state.last_edited) == 0:
         st.warning("먼저 ‘1. 물건 입력’ 탭에 물건을 한 개 이상 입력해 주세요.")
@@ -322,26 +350,50 @@ with tab_photo:
         if bool(rows.iloc[target_idx].get(COL_LOCK)):
             st.warning("선택한 물건은 ‘크기 잠금’이 켜져 있습니다. 측정은 할 수 있지만 표에는 적용되지 않습니다.")
 
-        c1, c2 = st.columns(2)
-        marker_cm = c1.number_input("마커 한 변의 실제 길이 (cm)", min_value=0.5, max_value=50.0,
-                                    value=5.0, step=0.1, help="출력한 마커의 실제 한 변 길이를 정확히 입력하세요.")
-        dict_name = c2.selectbox("ArUco 사전", list(ARUCO_DICTS.keys()), index=0,
-                                 help="마커를 만들 때 쓴 사전과 같아야 합니다.")
+        marker_cm = DEFAULT_MARKER_CM
+        dict_name = "DICT_4X4_50"
+        if reference == REF_MARKER:
+            c1, c2 = st.columns([2, 1])
+            if os.path.exists(MARKER_PDF):
+                with open(MARKER_PDF, "rb") as f:
+                    c1.download_button("📄 인쇄용 마커 받기 (A4, 한 변 6cm)", f.read(),
+                                       file_name="SmartPack_마커_6cm_A4.pdf", mime="application/pdf",
+                                       width="stretch")
+            custom = c2.checkbox("마커 크기 직접 입력", key="marker_custom",
+                                 help="화면에 띄운 마커나 다른 크기로 인쇄한 마커를 쓸 때만 켜세요.")
+            if custom:
+                c3, c4 = st.columns(2)
+                marker_cm = c3.number_input("마커 한 변의 실제 길이 (cm)", min_value=0.5, max_value=50.0,
+                                            value=DEFAULT_MARKER_CM, step=0.05,
+                                            help="검은 사각형 바깥 테두리 한 변을 자로 잰 값")
+                dict_name = c4.selectbox("ArUco 사전", list(ARUCO_DICTS.keys()), index=0,
+                                         help="마커를 만들 때 쓴 사전과 같아야 합니다.")
+            else:
+                st.caption(f"인쇄용 마커 기준 한 변 {DEFAULT_MARKER_CM:.1f}cm로 계산합니다. "
+                           "인쇄 후 확인용 자가 10cm인지 한 번 재 보세요.")
+        else:
+            st.caption(f"카드 규격 {CARD_W_CM} × {CARD_H_CM:.2f}cm (ISO/IEC 7810 ID-1)로 계산합니다.")
 
+        card_roi_top = card_roi_side = None
         with st.expander("① 상면 사진 (가로·깊이) - 필수", expanded=True):
             top_bytes = photo_input("상면 사진", "top")
             roi_top = roi_input("top")
+            if reference == REF_CARD:
+                card_roi_top = roi_input("top_card", "카드 영역 직접 지정 (카드를 못 찾을 때)")
         with st.expander("② 측면 사진 (높이) - 선택", expanded=False):
             side_bytes = photo_input("측면 사진", "side")
             roi_side = roi_input("side")
+            if reference == REF_CARD:
+                card_roi_side = roi_input("side_card", "카드 영역 직접 지정 (카드를 못 찾을 때)")
 
         if st.button("✨ AI 크기 추정", type="primary", width="stretch"):
             if top_bytes is None:
                 st.error("상면 사진을 먼저 올려 주세요.")
             else:
-                with st.spinner("마커 기준으로 측정하는 중..."):
+                with st.spinner(f"{ref_word} 기준으로 측정하는 중..."):
                     run_estimation(target_idx, str(rows.iloc[target_idx][COL_NAME]), marker_cm, dict_name,
-                                   top_bytes, side_bytes, roi_top, roi_side)
+                                   top_bytes, side_bytes, roi_top, roi_side, reference,
+                                   card_roi_top, card_roi_side)
 
         if st.session_state.apply_msg:
             kind, msg = st.session_state.apply_msg

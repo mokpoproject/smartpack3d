@@ -3,7 +3,9 @@ vision.py - ArUco 마커 기준 기하 측정 모듈 (OpenCV)
 
 핵심 원리
 ---------
-1. 사진 한 장만으로는 cm 크기를 알 수 없으므로, 크기를 아는 ArUco 마커를 기준 물체로 씁니다.
+1. 사진 한 장만으로는 cm 크기를 알 수 없으므로, 크기를 아는 기준 물체를 함께 찍습니다.
+   - ArUco 마커 (정밀 모드): 무늬로 꼭짓점을 정확히 찾습니다. 기본 인쇄 파일은 한 변 6cm.
+   - 체크카드 (간편 모드): 국제 규격 85.60 × 53.98 mm. 누구나 가지고 있어 따로 준비할 필요가 없습니다.
 2. 마커의 4개 꼭짓점으로 호모그래피를 구해 촬영 평면을 정면(수직)으로 펴 줍니다(PlaneRectifier).
 3. 펴진 이미지에서 마커가 아닌 가장 큰 윤곽을 물체로 보고 cm 단위로 측정합니다(ObjectSegmenter).
 4. 촬영 조건(마커 크기, 기울기, 윤곽 품질)으로 신뢰도를 계산합니다.
@@ -38,6 +40,14 @@ MAX_DIM_CM = 150.0           # 이보다 큰 치수는 비현실적으로 보고
 MAX_CANVAS_PX = 3000         # 평면 보정 결과 이미지의 최대 한 변 픽셀 수.
 MIN_OBJECT_CM2 = 4.0         # 이보다 작은 윤곽은 물체로 보지 않습니다.
 MAX_OBJECT_AREA_RATIO = 0.8  # 보정 이미지의 이 비율보다 큰 윤곽은 배경으로 봅니다.
+
+# 기준 물체
+DEFAULT_MARKER_CM = 6.0      # markers/aruco_id7_6cm_A4.pdf를 100%로 인쇄했을 때 마커 한 변 길이
+CARD_W_CM = 8.56             # 신용·체크카드 국제 규격 ISO/IEC 7810 ID-1 (85.60 × 53.98 mm)
+CARD_H_CM = 5.398
+CARD_ASPECT = CARD_W_CM / CARD_H_CM
+REF_MARKER = "marker"
+REF_CARD = "card"
 
 # 사용 가능한 ArUco 사전 이름 -> OpenCV 상수 (UI 선택지로 사용)
 ARUCO_DICTS: Dict[str, int] = {
@@ -81,6 +91,43 @@ class MarkerDetection:
         return float(min(lengths) / (max(lengths) + 1e-9))
 
 
+def _edge_lengths(pts: np.ndarray) -> List[float]:
+    return [float(np.linalg.norm(pts[i] - pts[(i + 1) % 4])) for i in range(4)]
+
+
+def _max_angle_dev(pts: np.ndarray) -> float:
+    devs = []
+    for i in range(4):
+        a = pts[(i - 1) % 4] - pts[i]
+        b = pts[(i + 1) % 4] - pts[i]
+        cos = float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
+        devs.append(abs(math.degrees(math.acos(max(-1.0, min(1.0, cos)))) - 90.0))
+    return max(devs)
+
+
+@dataclass(frozen=True)
+class CardDetection:
+    """감지된 체크카드. corners (4, 2)는 첫 변(0→1)이 카드의 긴 변이 되도록 정렬됩니다."""
+
+    corners: np.ndarray
+    marker_id: Optional[int] = None  # 마커와 같은 인터페이스를 위해 둡니다(카드는 번호 없음).
+
+    @property
+    def side_px(self) -> float:
+        """짧은 변의 평균 길이(px). 해상도 판단에 씁니다."""
+        e = _edge_lengths(self.corners)
+        return (e[1] + e[3]) / 2.0
+
+    def max_angle_deviation_deg(self) -> float:
+        return _max_angle_dev(self.corners)
+
+    def skew_ratio(self) -> float:
+        """마주 보는 변끼리의 길이 비율 중 작은 값. 1.0에 가까울수록 정면에 가깝습니다."""
+        e = _edge_lengths(self.corners)
+        return float(min(min(e[0], e[2]) / (max(e[0], e[2]) + 1e-9),
+                         min(e[1], e[3]) / (max(e[1], e[3]) + 1e-9)))
+
+
 @dataclass
 class ObjectBlob:
     """평면 보정 이미지에서 찾은 물체 윤곽 정보(좌표는 보정 캔버스 기준 px)."""
@@ -101,14 +148,15 @@ class PhotoMeasurement:
     dims_cm: Dict[str, float] = field(default_factory=dict)  # top: width/depth, side: height
     marker_found: bool = False
     marker_id: Optional[int] = None
+    reference: str = REF_MARKER                # 기준 물체 종류: "marker" 또는 "card"
     confidence: float = 0.0
     warnings: List[str] = field(default_factory=list)
     error: Optional[str] = None
     preview_bgr: Optional[np.ndarray] = None  # 측정 검증용 오버레이 이미지
 
     @classmethod
-    def failed(cls, error: str, marker_found: bool = False) -> "PhotoMeasurement":
-        return cls(ok=False, error=error, marker_found=marker_found)
+    def failed(cls, error: str, marker_found: bool = False, reference: str = REF_MARKER) -> "PhotoMeasurement":
+        return cls(ok=False, error=error, marker_found=marker_found, reference=reference)
 
 
 @dataclass
@@ -196,6 +244,190 @@ class MarkerDetector:
 
 
 # --------------------------------------------------------------------------- #
+# 체크카드 검출
+# --------------------------------------------------------------------------- #
+class CardDetector:
+    """사진에서 체크카드(85.60 × 53.98 mm) 모양의 사각형을 찾는 클래스.
+
+    카드는 마커처럼 무늬가 없으므로, 윤곽 중에서
+    (1) 꼭짓점 4개로 근사되고 (2) 직사각형에 가깝고 (3) 가로:세로 비율이 카드(약 1.586)와 비슷한 것을 고릅니다.
+    모서리가 둥글어서 생기는 오차는 네 변에 직선을 맞춘 뒤 교점을 구해 줄입니다.
+    """
+
+    MIN_AREA_RATIO = 0.004   # 사진 넓이 대비 최소 크기
+    MAX_AREA_RATIO = 0.85
+    ASPECT_TOL = 0.18        # |log(비율 / 카드 비율)| 허용치 (비스듬한 촬영 고려)
+
+    def find(self, image_bgr: np.ndarray,
+             roi: Optional[Tuple[float, float, float, float]] = None) -> Optional[CardDetection]:
+        h, w = image_bgr.shape[:2]
+        gray = cv2.GaussianBlur(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+        # 밝기 기준(Otsu) 윤곽이 카드 테두리를 가장 정확히 따라가므로 먼저 찾고,
+        # 배경과 밝기 차이가 작아 실패하면 경계선(Canny) 윤곽으로 다시 찾습니다.
+        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        edges = cv2.dilate(cv2.Canny(gray, 40, 120), np.ones((3, 3), np.uint8))
+        for masks in ([otsu, cv2.bitwise_not(otsu)], [edges]):
+            card = self._best(masks, w, h, roi, gray)
+            if card is not None:
+                return card
+        return None
+
+    def _best(self, masks, w: int, h: int,
+              roi: Optional[Tuple[float, float, float, float]], gray: np.ndarray) -> Optional[CardDetection]:
+        roi_box = None
+        if roi is not None:
+            x0, y0, x1, y1 = roi
+            roi_box = (x0 * w, y0 * h, x1 * w, y1 * h)
+
+        best, best_score = None, None
+        for m in masks:
+            contours, _ = cv2.findContours(m, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < self.MIN_AREA_RATIO * w * h or area > self.MAX_AREA_RATIO * w * h:
+                    continue
+                quad = self._quad(c)
+                if quad is None:
+                    continue
+                quad = self._refine(c, quad)
+                quad = self._subpixel(gray, quad)
+                cx, cy = quad.mean(axis=0)
+                if roi_box is not None and not (roi_box[0] <= cx <= roi_box[2] and roi_box[1] <= cy <= roi_box[3]):
+                    continue
+                e = _edge_lengths(quad)
+                long_ = (e[0] + e[2]) / 2.0
+                short = (e[1] + e[3]) / 2.0
+                if short < 1:
+                    continue
+                aspect_err = abs(math.log((long_ / short) / CARD_ASPECT))
+                if aspect_err > self.ASPECT_TOL or _max_angle_dev(quad) > 25:
+                    continue
+                if min(e[0], e[2]) / max(e[0], e[2]) < 0.7 or min(e[1], e[3]) / max(e[1], e[3]) < 0.7:
+                    continue
+                hull_area = cv2.contourArea(cv2.convexHull(c))
+                quad_area = cv2.contourArea(quad.astype(np.float32))
+                fill = hull_area / (quad_area + 1e-9)
+                if not 0.9 <= fill <= 1.1:
+                    continue  # 직사각형 모양이 아님
+                score = aspect_err + abs(1.0 - fill)
+                if best_score is None or score < best_score:
+                    best, best_score = CardDetection(quad.astype(np.float32)), score
+        return best
+
+    @staticmethod
+    def _order(pts: np.ndarray) -> np.ndarray:
+        """TL, TR, BR, BL 순서로 정렬한 뒤, 첫 변이 긴 변이 되도록 회전합니다."""
+        pts = pts.reshape(4, 2).astype(np.float64)
+        s = pts.sum(axis=1)
+        d = pts[:, 1] - pts[:, 0]
+        ordered = np.array([pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]])
+        if len({tuple(p) for p in ordered}) < 4:
+            return None
+        e = _edge_lengths(ordered)
+        if e[0] + e[2] < e[1] + e[3]:
+            ordered = np.roll(ordered, -1, axis=0)
+        return ordered
+
+    def _quad(self, contour: np.ndarray) -> Optional[np.ndarray]:
+        hull = cv2.convexHull(contour)
+        peri = cv2.arcLength(hull, True)
+        for eps in (0.01, 0.02, 0.03, 0.05, 0.08):
+            approx = cv2.approxPolyDP(hull, eps * peri, True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                return self._order(approx)
+            if len(approx) < 4:
+                break
+        return None
+
+    @staticmethod
+    def _refine(contour: np.ndarray, quad: np.ndarray) -> np.ndarray:
+        """각 변 가운데 부분의 윤곽 점에 직선을 맞추고, 이웃한 직선의 교점을 새 꼭짓점으로 씁니다.
+        (카드 모서리가 둥글어서 근사 꼭짓점이 안쪽으로 들어가는 오차를 줄입니다.)"""
+        pts = contour.reshape(-1, 2).astype(np.float64)
+        lines = []
+        for i in range(4):
+            a, b = quad[i], quad[(i + 1) % 4]
+            ab = b - a
+            L = np.linalg.norm(ab)
+            if L < 1:
+                return quad
+            u = ab / L
+            n = np.array([-u[1], u[0]])
+            t = (pts - a) @ u / L
+            dist = np.abs((pts - a) @ n)
+            sel = pts[(t > 0.15) & (t < 0.85) & (dist < max(3.0, 0.03 * L))]
+            if len(sel) < 10:
+                return quad
+            vx, vy, x0, y0 = cv2.fitLine(sel.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01).flatten()
+            lines.append((np.array([x0, y0], np.float64), np.array([vx, vy], np.float64)))
+        out = []
+        for i in range(4):
+            (p1, d1), (p2, d2) = lines[i - 1], lines[i]
+            A = np.array([d1, -d2]).T
+            if abs(np.linalg.det(A)) < 1e-6:
+                return quad
+            s, _ = np.linalg.solve(A, p2 - p1)
+            out.append(p1 + s * d1)
+        out = np.array(out)
+        # 맞춘 꼭짓점이 원래 근사점에서 너무 멀면(오검출) 원래 값을 씁니다.
+        if np.max(np.linalg.norm(out - quad, axis=1)) > 0.08 * max(_edge_lengths(quad)):
+            return quad
+        return out
+
+    @staticmethod
+    def _subpixel(gray: np.ndarray, quad: np.ndarray, half: int = 6, samples: int = 40) -> np.ndarray:
+        """각 변을 따라 수직 방향 밝기 변화가 가장 큰 위치를 소수점 픽셀까지 찾아 직선을 다시 맞춥니다.
+        (픽셀 계단 모양 윤곽보다 정확해서, 비스듬히 찍은 사진의 원근 보정 오차를 줄여 줍니다.)"""
+        g = gray.astype(np.float32)
+        lines = []
+        center = quad.mean(axis=0)
+        for i in range(4):
+            a, b = quad[i], quad[(i + 1) % 4]
+            ab = b - a
+            L = np.linalg.norm(ab)
+            if L < 10:
+                return quad
+            u = ab / L
+            n = np.array([-u[1], u[0]])
+            if np.dot((a + b) / 2 - center, n) < 0:
+                n = -n  # 바깥쪽을 향하도록
+            offs = np.arange(-half, half + 1, dtype=np.float32)
+            pts = []
+            for t in np.linspace(0.15, 0.85, samples):
+                p0 = a + t * ab
+                xs = (p0[0] + offs * n[0]).astype(np.float32)
+                ys = (p0[1] + offs * n[1]).astype(np.float32)
+                prof = cv2.remap(g, xs.reshape(1, -1), ys.reshape(1, -1), cv2.INTER_LINEAR).ravel()
+                d = np.abs(np.diff(prof))
+                k = int(np.argmax(d))
+                if d[k] < 8:  # 경계가 뚜렷하지 않음
+                    continue
+                frac = 0.0
+                if 0 < k < len(d) - 1:
+                    den = d[k - 1] - 2 * d[k] + d[k + 1]
+                    if abs(den) > 1e-6:
+                        frac = 0.5 * (d[k - 1] - d[k + 1]) / den
+                off = offs[k] + 0.5 + frac
+                pts.append(p0 + off * n)
+            if len(pts) < samples // 3:
+                return quad
+            vx, vy, x0, y0 = cv2.fitLine(np.array(pts, np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01).flatten()
+            lines.append((np.array([x0, y0], np.float64), np.array([vx, vy], np.float64)))
+        out = []
+        for i in range(4):
+            (p1, d1), (p2, d2) = lines[i - 1], lines[i]
+            A = np.array([d1, -d2]).T
+            if abs(np.linalg.det(A)) < 1e-6:
+                return quad
+            s, _ = np.linalg.solve(A, p2 - p1)
+            out.append(p1 + s * d1)
+        out = np.array(out)
+        if np.max(np.linalg.norm(out - quad, axis=1)) > 0.05 * max(_edge_lengths(quad)):
+            return quad
+        return out
+
+
+# --------------------------------------------------------------------------- #
 # 평면 보정
 # --------------------------------------------------------------------------- #
 class PlaneRectifier:
@@ -205,13 +437,19 @@ class PlaneRectifier:
     따라서 물체는 마커와 같은 평면(같은 바닥 또는 같은 벽면)에 있어야 합니다.
     """
 
-    def __init__(self, marker: MarkerDetection, marker_cm: float, image_shape: Tuple[int, ...]) -> None:
-        if marker_cm <= 0:
-            raise ValueError("마커의 실제 한 변 길이는 0보다 커야 합니다.")
+    def __init__(self, marker, marker_cm: float, image_shape: Tuple[int, ...],
+                 ref_h_cm: Optional[float] = None) -> None:
+        """marker: MarkerDetection 또는 CardDetection. 기준 물체는 marker_cm × ref_h_cm 직사각형
+        (ref_h_cm이 없으면 정사각형 마커)이며, 첫 변(꼭짓점 0→1)이 marker_cm 쪽입니다."""
+        if marker_cm <= 0 or (ref_h_cm is not None and ref_h_cm <= 0):
+            raise ValueError("기준 물체의 실제 길이는 0보다 커야 합니다.")
         self.marker = marker
         self.marker_cm = marker_cm
+        self.ref_h_cm = ref_h_cm if ref_h_cm is not None else marker_cm
         self.image_shape = image_shape
-        self.px_per_cm = float(np.clip(marker.side_px / marker_cm, 3.0, 80.0))
+        e = _edge_lengths(np.asarray(marker.corners, dtype=np.float64))
+        ppc = ((e[0] + e[2]) / 2.0 / self.marker_cm + (e[1] + e[3]) / 2.0 / self.ref_h_cm) / 2.0
+        self.px_per_cm = float(np.clip(ppc, 3.0, 80.0))
         self._build()
 
     def _build(self) -> None:
@@ -220,9 +458,10 @@ class PlaneRectifier:
         image_corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64).reshape(-1, 1, 2)
 
         for _ in range(4):
-            side = self.marker_cm * self.px_per_cm
-            dst = np.array([[0, 0], [side, 0], [side, side], [0, side]], dtype=np.float32)
-            h0 = cv2.getPerspectiveTransform(self.marker.corners, dst)
+            rw = self.marker_cm * self.px_per_cm
+            rh = self.ref_h_cm * self.px_per_cm
+            dst = np.array([[0, 0], [rw, 0], [rw, rh], [0, rh]], dtype=np.float32)
+            h0 = cv2.getPerspectiveTransform(np.asarray(self.marker.corners, dtype=np.float32), dst)
             projected = cv2.perspectiveTransform(image_corners, h0).reshape(-1, 2)
             if not np.all(np.isfinite(projected)):
                 raise ValueError("마커 기울기가 너무 커서 평면 보정에 실패했습니다. 더 정면에서 찍어 주세요.")
@@ -233,7 +472,7 @@ class PlaneRectifier:
                 break
             self.px_per_cm *= MAX_CANVAS_PX / max(cw, ch)  # 캔버스가 너무 크면 해상도를 낮춥니다.
         else:
-            raise ValueError("사진 범위가 마커에 비해 너무 넓습니다. 마커와 물건이 더 가깝게 보이도록 찍어 주세요.")
+            raise ValueError("사진 범위가 기준 물체(마커·카드)에 비해 너무 넓습니다. 기준 물체와 물건이 더 가깝게 보이도록 찍어 주세요.")
 
         translate = np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1]], dtype=np.float64)
         self.H = translate @ h0
@@ -347,33 +586,62 @@ class ObjectMeasurer:
     """마커 검출 -> 평면 보정 -> 물체 분할 -> cm 측정을 한 번에 수행하는 클래스."""
 
     def __init__(self, detector: Optional[MarkerDetector] = None,
-                 segmenter: Optional[ObjectSegmenter] = None) -> None:
+                 segmenter: Optional[ObjectSegmenter] = None,
+                 card_detector: Optional[CardDetector] = None) -> None:
         self.detector = detector or MarkerDetector()
         self.segmenter = segmenter or ObjectSegmenter()
+        self.card_detector = card_detector or CardDetector()
 
     def measure_top(
         self,
         image_bgr: np.ndarray,
-        marker_cm: float,
+        marker_cm: float = DEFAULT_MARKER_CM,
         marker_id: Optional[int] = None,
         roi: Optional[Tuple[float, float, float, float]] = None,
+        reference: str = REF_MARKER,
+        card_roi: Optional[Tuple[float, float, float, float]] = None,
     ) -> PhotoMeasurement:
-        """상면 사진에서 가로(긴 변)와 깊이(짧은 변)를 측정합니다."""
-        return self._measure(image_bgr, marker_cm, marker_id, roi, view="top")
+        """상면 사진에서 가로(긴 변)와 깊이(짧은 변)를 측정합니다.
+        reference="card"이면 마커 대신 체크카드를 기준으로 씁니다(marker_cm 무시)."""
+        return self._measure(image_bgr, marker_cm, marker_id, roi, "top", reference, card_roi)
 
     def measure_side(
         self,
         image_bgr: np.ndarray,
-        marker_cm: float,
+        marker_cm: float = DEFAULT_MARKER_CM,
         marker_id: Optional[int] = None,
         roi: Optional[Tuple[float, float, float, float]] = None,
+        reference: str = REF_MARKER,
+        card_roi: Optional[Tuple[float, float, float, float]] = None,
     ) -> PhotoMeasurement:
-        """측면 사진에서 높이를 측정합니다. 마커는 똑바로 세워져 있어야 합니다."""
-        return self._measure(image_bgr, marker_cm, marker_id, roi, view="side")
+        """측면 사진에서 높이를 측정합니다. 마커(또는 카드)는 똑바로 세워져 있어야 합니다."""
+        return self._measure(image_bgr, marker_cm, marker_id, roi, "side", reference, card_roi)
+
+    def _find_reference(self, image_bgr, marker_cm, marker_id, reference, card_roi, warnings):
+        """기준 물체를 찾아 (검출 결과, 긴 변 cm, 짧은 변 cm) 또는 실패 결과를 돌려줍니다."""
+        if reference == REF_CARD:
+            card = self.card_detector.find(image_bgr, card_roi)
+            if card is None:
+                return PhotoMeasurement.failed(
+                    "체크카드를 찾지 못했습니다. 카드 전체가 보이게, 배경과 색이 다른 바닥 위에 놓고 찍어 주세요. "
+                    "그래도 안 되면 '카드 영역 직접 지정'을 사용하세요.",
+                    reference=REF_CARD,
+                )
+            return card, CARD_W_CM, CARD_H_CM
+        return self._find_marker(image_bgr, marker_cm, marker_id, warnings)
 
     def _measure(self, image_bgr: np.ndarray, marker_cm: float, marker_id: Optional[int],
-                 roi: Optional[Tuple[float, float, float, float]], view: str) -> PhotoMeasurement:
+                 roi: Optional[Tuple[float, float, float, float]], view: str,
+                 reference: str = REF_MARKER,
+                 card_roi: Optional[Tuple[float, float, float, float]] = None) -> PhotoMeasurement:
         warnings: List[str] = []
+        found = self._find_reference(image_bgr, marker_cm, marker_id, reference, card_roi, warnings)
+        if isinstance(found, PhotoMeasurement):
+            return found
+        marker, ref_w_cm, ref_h_cm = found
+        return self._measure_with(image_bgr, marker, ref_w_cm, ref_h_cm, roi, view, reference, warnings)
+
+    def _find_marker(self, image_bgr, marker_cm, marker_id, warnings):
         all_markers = self.detector.detect(image_bgr)
         if not all_markers:
             return PhotoMeasurement.failed(
@@ -386,16 +654,20 @@ class ObjectMeasurer:
         assert marker is not None  # 위에서 존재 여부를 확인했습니다.
         if len(all_markers) > 1 and marker_id is None:
             warnings.append("마커가 여러 개 보여 가장 큰 마커를 기준으로 사용했습니다.")
+        return marker, marker_cm, marker_cm
+
+    def _measure_with(self, image_bgr, marker, ref_w_cm, ref_h_cm, roi, view, reference, warnings):
+        ref_name = "카드" if reference == REF_CARD else "마커"
         if marker.side_px < MIN_MARKER_PX:
             return PhotoMeasurement.failed(
-                f"마커가 너무 작게 찍혔습니다({marker.side_px:.0f}px). 더 가까이에서 찍어 주세요.",
-                marker_found=True,
+                f"{ref_name}가 너무 작게 찍혔습니다({marker.side_px:.0f}px). 더 가까이에서 찍어 주세요.",
+                marker_found=True, reference=reference,
             )
 
         try:
-            rectifier = PlaneRectifier(marker, marker_cm, image_bgr.shape)
+            rectifier = PlaneRectifier(marker, ref_w_cm, image_bgr.shape, ref_h_cm=ref_h_cm)
         except ValueError as e:
-            return PhotoMeasurement.failed(str(e), marker_found=True)
+            return PhotoMeasurement.failed(str(e), marker_found=True, reference=reference)
 
         canvas = rectifier.warp(image_bgr)
         roi_poly = rectifier.map_points(roi_to_corners(roi, image_bgr.shape)) if roi else None
@@ -404,7 +676,7 @@ class ObjectMeasurer:
             return PhotoMeasurement.failed(
                 "물체 윤곽을 찾지 못했습니다. 물체와 배경의 밝기 차이를 크게 하거나, "
                 "'물건 영역 직접 지정'으로 물건만 포함되게 지정해 주세요.",
-                marker_found=True,
+                marker_found=True, reference=reference,
             )
 
         ppc = rectifier.px_per_cm
@@ -417,16 +689,16 @@ class ObjectMeasurer:
         else:
             _, _, _, bh = blob.bbox
             dims = {"height": round(bh / ppc, 1)}
-            warnings.append("측면 사진의 높이는 마커가 똑바로 세워져 있다고 가정합니다.")
+            warnings.append(f"측면 사진의 높이는 {ref_name}가 똑바로 세워져 있다고 가정합니다.")
 
         # 측정 신뢰도 계산 (각 요인의 곱)
         side_px = marker.side_px
         marker_conf = 1.0 if side_px >= GOOD_MARKER_PX else 0.7
         if side_px < GOOD_MARKER_PX:
-            warnings.append(f"마커 해상도가 낮습니다({side_px:.0f}px, 권장 {GOOD_MARKER_PX:.0f}px 이상).")
+            warnings.append(f"{ref_name} 해상도가 낮습니다({side_px:.0f}px, 권장 {GOOD_MARKER_PX:.0f}px 이상).")
         quality = rectifier.quality()
         if quality < 0.8:
-            warnings.append("마커가 비스듬히 찍혀 보정 오차가 커질 수 있습니다.")
+            warnings.append(f"{ref_name}가 비스듬히 찍혀 보정 오차가 커질 수 있습니다.")
         blob_conf = 1.0
         if blob.touches_border:
             blob_conf *= 0.5
@@ -435,20 +707,25 @@ class ObjectMeasurer:
             blob_conf *= 0.75
             warnings.append("물건 윤곽이 불규칙합니다. 그림자가 섞였을 수 있습니다.")
 
-        confidence = round(marker_conf * quality * blob_conf, 2)
+        ref_conf = 1.0
+        if reference == REF_CARD:
+            ref_conf = 0.9  # 카드는 무늬가 없어 마커보다 꼭짓점 위치가 덜 정확합니다.
+            warnings.append("체크카드 기준 측정입니다. 더 정확하게 재려면 ArUco 마커 모드를 사용하세요.")
+        confidence = round(marker_conf * quality * blob_conf * ref_conf, 2)
         preview = self._preview(canvas, marker, rectifier, blob)
         return PhotoMeasurement(
             ok=True,
             dims_cm=dims,
             marker_found=True,
             marker_id=marker.marker_id,
+            reference=reference,
             confidence=confidence,
             warnings=warnings,
             preview_bgr=preview,
         )
 
     @staticmethod
-    def _preview(canvas: np.ndarray, marker: MarkerDetection,
+    def _preview(canvas: np.ndarray, marker,
                  rectifier: PlaneRectifier, blob: ObjectBlob) -> np.ndarray:
         """사용자가 측정 결과를 눈으로 확인할 수 있도록 윤곽과 마커를 그린 이미지를 만듭니다."""
         img = canvas.copy()
@@ -491,7 +768,7 @@ class SizeEstimator:
             value = getattr(est, attr)
             if value is not None and not (MIN_DIM_CM <= value <= MAX_DIM_CM):
                 est.errors.append(
-                    f"{label} {value}cm는 비현실적인 값이라 적용하지 않습니다. 마커 크기 입력과 촬영 거리를 확인해 주세요."
+                    f"{label} {value}cm는 비현실적인 값이라 적용하지 않습니다. 기준 물체(마커 크기 입력·카드)와 촬영 거리를 확인해 주세요."
                 )
                 setattr(est, attr, None)
         return est
