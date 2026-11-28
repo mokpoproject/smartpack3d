@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<!--
+  SmartPack 3D 사진 도우미 (Streamlit 커스텀 컴포넌트, 빌드 불필요)
+
+  mode = "camera" : 가이드 네모가 그려진 카메라. 왼쪽 칸에 기준(카드/마커), 오른쪽 칸에 물건을 맞춰 찍습니다.
+                    찍은 뒤 물건을 한 번 탭하면 그 위치를 돌려줍니다.
+  mode = "tap"    : 이미 올린 사진(args.image, dataURL)에서 물건을 한 번 탭하게 합니다.
+
+  돌려주는 값(JSON):
+    { image: dataURL | null,        // camera 모드에서 찍은 사진 (tap 모드는 null)
+      seed: [x, y] | null,          // 탭한 위치 (사진 기준 0~1 비율)
+      ref_roi: [x0, y0, x1, y1] | null,  // 기준 칸 위치 (0~1 비율, 여유 포함)
+      ts: number }
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --accent: #ff4b4b; --ok: #21c35b; --ref: #29b5e8; --text: #31333f; --bg: #f0f2f6; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; font-family: "Source Sans Pro", system-ui, sans-serif; color: var(--text); background: transparent; }
+  .wrap { position: relative; width: 100%; border-radius: 10px; overflow: hidden; background: #111; touch-action: manipulation; }
+  video, canvas.still { display: block; width: 100%; height: auto; }
+  svg.overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .bar { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  button { flex: 1; min-width: 120px; padding: 10px 12px; border-radius: 8px; border: 1px solid #d0d3da; background: #fff;
+           font-size: 15px; cursor: pointer; color: var(--text); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  .hint { font-size: 14px; margin: 6px 2px 0; line-height: 1.4; }
+  .err { color: #b00020; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div class="wrap" id="stage">
+    <video id="video" autoplay playsinline muted class="hidden"></video>
+    <canvas id="still" class="still hidden"></canvas>
+    <svg class="overlay" id="overlay" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="bar" id="bar">
+    <button id="start" class="primary hidden">📷 카메라 켜기</button>
+    <button id="shoot" class="primary hidden">📸 찍기</button>
+    <button id="flip" class="hidden">🔄 카메라 전환</button>
+    <button id="retake" class="hidden">↩ 다시 찍기</button>
+  </div>
+  <p class="hint" id="hint"></p>
+</div>
+
+<script>
+(function () {
+  // ---------------- Streamlit 통신 (postMessage 프로토콜) ----------------
+  function send(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
+  }
+  function setValue(v) { send("streamlit:setComponentValue", { value: v, dataType: "json" }); }
+  function setHeight() { send("streamlit:setFrameHeight", { height: document.getElementById("root").getBoundingClientRect().height + 6 }); }
+
+  const $ = (id) => document.getElementById(id);
+  const video = $("video"), still = $("still"), overlay = $("overlay"), hint = $("hint");
+  const btnStart = $("start"), btnShoot = $("shoot"), btnFlip = $("flip"), btnRetake = $("retake");
+
+  let args = {}, initialized = false;
+  let stream = null, facing = "environment";
+  let captured = null;   // camera 모드: 찍은 사진 dataURL
+  let seed = null;       // [x, y] 0~1
+  let tapImageSrc = null;
+  let imgW = 0, imgH = 0;
+
+  // ---------------- 가이드 칸 (0~1 비율) ----------------
+  // 기준 칸: 카드는 가로:세로 = 1.586, 마커는 정사각형. 물건 칸은 오른쪽 넓은 영역.
+  function guideRects(w, h) {
+    const isCard = args.reference === "card";
+    const aspect = isCard ? 8.56 / 5.398 : 1.0;
+    const refWpx = w * (isCard ? 0.30 : 0.22);
+    const refHpx = refWpx / aspect;
+    const refX = w * 0.05, refY = (h - refHpx) / 2;
+    const ref = [refX / w, refY / h, (refX + refWpx) / w, (refY + refHpx) / h];
+    const objX0 = (refX + refWpx) / w + 0.06;
+    const obj = [objX0, 0.12, 0.95, 0.88];
+    return { ref: ref, obj: obj };
+  }
+
+  function pad(r, f) {
+    const cw = r[2] - r[0], ch = r[3] - r[1];
+    return [Math.max(0, r[0] - cw * f), Math.max(0, r[1] - ch * f), Math.min(1, r[2] + cw * f), Math.min(1, r[3] + ch * f)];
+  }
+
+  function drawOverlay(showGuide) {
+    const w = 1000, h = imgW && imgH ? Math.round(1000 * imgH / imgW) : 750;
+    overlay.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    let s = "";
+    if (showGuide) {
+      const g = guideRects(w, h);
+      const R = (r, color, label, dash) => {
+        const x = r[0] * w, y = r[1] * h, rw = (r[2] - r[0]) * w, rh = (r[3] - r[1]) * h;
+        return `<rect x="${x}" y="${y}" width="${rw}" height="${rh}" rx="10" fill="none" stroke="${color}"
+                 stroke-width="5" ${dash ? 'stroke-dasharray="18 12"' : ""}/>
+                <rect x="${x}" y="${Math.max(0, y - 44)}" width="${label.length * 28 + 20}" height="40" rx="8" fill="${color}" opacity=".9"/>
+                <text x="${x + 10}" y="${Math.max(0, y - 44) + 29}" font-size="26" fill="${color === "#ffffff" ? "#111" : "#fff"}" font-weight="700">${label}</text>`;
+      };
+      s += R(g.ref, "#29b5e8", args.reference === "card" ? "카드" : "마커", false);
+      s += R(g.obj, "#ffffff", "물건", true);
+    }
+    if (seed) {
+      const cx = seed[0] * w, cy = seed[1] * h;
+      s += `<circle cx="${cx}" cy="${cy}" r="22" fill="#ffd400" stroke="#000" stroke-width="4"/>
+            <circle cx="${cx}" cy="${cy}" r="5" fill="#000"/>`;
+    }
+    overlay.innerHTML = s;
+  }
+
+  function emit() {
+    let refRoi = null;
+    if (args.mode === "camera" && captured) refRoi = pad(guideRects(1, imgH / imgW).ref, 0.35);
+    setValue({ image: args.mode === "camera" ? captured : null, seed: seed, ref_roi: refRoi, ts: Date.now() });
+  }
+
+  // ---------------- 카메라 ----------------
+  async function startCamera() {
+    stopCamera();
+    hint.classList.remove("err");
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      hint.textContent = "이 브라우저에서는 카메라를 쓸 수 없습니다. 휴대폰은 https 주소(예: Streamlit Cloud)나 PC의 localhost에서만 카메라가 켜집니다. 대신 '사진 올리기'를 사용하세요.";
+      hint.classList.add("err"); setHeight(); return;
+    }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+      imgW = video.videoWidth; imgH = video.videoHeight;
+      video.classList.remove("hidden"); still.classList.add("hidden");
+      btnStart.classList.add("hidden"); btnShoot.classList.remove("hidden"); btnFlip.classList.remove("hidden");
+      btnRetake.classList.add("hidden");
+      hint.textContent = args.reference === "card"
+        ? "파란 칸에 카드를, 흰 칸에 물건을 맞추고 위에서 수직으로 찍으세요."
+        : "파란 칸에 마커를, 흰 칸에 물건을 맞추고 찍으세요.";
+      drawOverlay(true);
+    } catch (e) {
+      hint.textContent = "카메라를 켜지 못했습니다 (" + e.name + "). 카메라 권한을 허용했는지 확인하세요. 휴대폰은 https 주소에서만 카메라가 켜집니다.";
+      hint.classList.add("err");
+      btnStart.classList.remove("hidden");
+    }
+    setTimeout(setHeight, 50);
+  }
+
+  function stopCamera() {
+    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  }
+
+  function shoot() {
+    if (!stream) return;
+    const w = video.videoWidth, h = video.videoHeight;
+    const maxSide = 1920, sc = Math.min(1, maxSide / Math.max(w, h));
+    still.width = Math.round(w * sc); still.height = Math.round(h * sc);
+    still.getContext("2d").drawImage(video, 0, 0, still.width, still.height);
+    captured = still.toDataURL("image/jpeg", 0.92);
+    imgW = still.width; imgH = still.height;
+    stopCamera();
+    video.classList.add("hidden"); still.classList.remove("hidden");
+    btnShoot.classList.add("hidden"); btnFlip.classList.add("hidden"); btnRetake.classList.remove("hidden");
+    // 기본 탭 위치 = 물건 칸 가운데 (사용자가 다시 탭하면 바뀝니다)
+    const g = guideRects(1, imgH / imgW).obj;
+    seed = [(g[0] + g[2]) / 2, (g[1] + g[3]) / 2];
+    hint.textContent = "찍었습니다. 사진에서 물건을 한 번 눌러 주세요 (노란 점 = 물건으로 인식할 위치).";
+    drawOverlay(true);
+    emit();
+    setTimeout(setHeight, 50);
+  }
+
+  // ---------------- 탭 처리 ----------------
+  $("stage").addEventListener("click", (ev) => {
+    if (still.classList.contains("hidden")) return;
+    const r = still.getBoundingClientRect();
+    const x = (ev.clientX - r.left) / r.width, y = (ev.clientY - r.top) / r.height;
+    if (x < 0 || x > 1 || y < 0 || y > 1) return;
+    seed = [Math.round(x * 10000) / 10000, Math.round(y * 10000) / 10000];
+    drawOverlay(args.mode === "camera");
+    hint.textContent = "물건 위치를 지정했습니다. 다른 곳을 누르면 바뀝니다.";
+    emit();
+  });
+
+  btnStart.onclick = startCamera;
+  btnShoot.onclick = shoot;
+  btnFlip.onclick = () => { facing = facing === "environment" ? "user" : "environment"; startCamera(); };
+  btnRetake.onclick = () => { captured = null; seed = null; emit(); startCamera(); };
+
+  function loadTapImage(src) {
+    if (src === tapImageSrc) return;
+    tapImageSrc = src;
+    const img = new Image();
+    img.onload = () => {
+      imgW = img.naturalWidth; imgH = img.naturalHeight;
+      still.width = imgW; still.height = imgH;
+      still.getContext("2d").drawImage(img, 0, 0);
+      still.classList.remove("hidden");
+      if (Array.isArray(args.seed)) seed = args.seed;
+      drawOverlay(false);
+      hint.textContent = seed ? "물건 위치를 지정했습니다. 다른 곳을 누르면 바뀝니다."
+                              : "사진에서 물건을 한 번 눌러 주세요. 그 점을 기준으로 물건만 오려내 크기를 잽니다.";
+      setTimeout(setHeight, 50);
+    };
+    img.src = src;
+  }
+
+  // ---------------- Streamlit 렌더 이벤트 ----------------
+  window.addEventListener("message", (ev) => {
+    const d = ev.data;
+    if (!d || d.type !== "streamlit:render") return;
+    const prevRef = args.reference;
+    args = d.args || {};
+    if (!initialized) {
+      initialized = true;
+      if (args.mode === "camera") {
+        btnStart.classList.remove("hidden");
+        hint.textContent = "‘카메라 켜기’를 누르면 가이드 네모가 나타납니다.";
+      } else {
+        $("bar").classList.add("hidden");
+      }
+    } else if (args.mode === "camera" && prevRef !== args.reference) {
+      drawOverlay(true);
+    }
+    if (args.mode === "tap" && args.image) loadTapImage(args.image);
+    setHeight();
+  });
+
+  window.addEventListener("resize", setHeight);
+  send("streamlit:componentReady", { apiVersion: 1 });
+  setHeight();
+})();
+</script>
+</body>
+</html>

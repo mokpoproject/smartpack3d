@@ -519,10 +519,19 @@ class ObjectSegmenter:
         marker_poly: np.ndarray,
         roi_poly: Optional[np.ndarray] = None,
     ) -> Optional[ObjectBlob]:
-        ch, cw = canvas_bgr.shape[:2]
-        gray = cv2.GaussianBlur(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        exclude, roi_mask, edge_band = self._masks(canvas_bgr.shape, marker_poly, roi_poly)
+        best: Optional[ObjectBlob] = None
+        best_key = None
+        for blob in self._otsu_blobs(canvas_bgr, px_per_cm, exclude, roi_mask, edge_band):
+            # 사진 가장자리에 닿지 않은 윤곽을 우선하고, 그다음 큰 윤곽을 고릅니다.
+            key = (not blob.touches_border, blob.area_px)
+            if best_key is None or key > best_key:
+                best, best_key = blob, key
+        return best
 
+    @staticmethod
+    def _masks(shape, marker_poly, roi_poly):
+        ch, cw = shape[:2]
         # 마커 영역(주변 여유 포함)은 물체 후보에서 제외합니다.
         exclude = np.zeros((ch, cw), np.uint8)
         cv2.fillPoly(exclude, [np.round(marker_poly).astype(np.int32)], 255)
@@ -539,21 +548,23 @@ class ObjectSegmenter:
         else:
             edge_band[0, :] = edge_band[-1, :] = 255
             edge_band[:, 0] = edge_band[:, -1] = 255
+        return exclude, roi_mask, edge_band
 
+    def _otsu_blobs(self, canvas_bgr, px_per_cm, exclude, roi_mask, edge_band) -> List[ObjectBlob]:
+        """밝은 물체/어두운 물체 두 경우의 Otsu 윤곽 후보를 모두 돌려줍니다."""
+        ch, cw = canvas_bgr.shape[:2]
+        gray = cv2.GaussianBlur(cv2.cvtColor(canvas_bgr, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         min_area_px = self.min_area_cm2 * px_per_cm * px_per_cm
         kernel_open = np.ones((3, 3), np.uint8)
         kernel_close = np.ones((7, 7), np.uint8)
-
-        best: Optional[ObjectBlob] = None
-        best_key = None
-        # 밝은 물체/어두운 물체 두 경우를 모두 시도합니다.
+        blobs: List[ObjectBlob] = []
         for mask in (binary, cv2.bitwise_not(binary)):
             mask = cv2.bitwise_and(mask, cv2.bitwise_not(exclude))
             if roi_mask is not None:
                 mask = cv2.bitwise_and(mask, roi_mask)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
-
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             for c in contours:
                 area = cv2.contourArea(c)
@@ -564,18 +575,146 @@ class ObjectSegmenter:
                 cv2.drawContours(filled, [c], -1, 255, thickness=cv2.FILLED)
                 touches = bool(cv2.bitwise_and(filled, edge_band).any())
                 hull_area = cv2.contourArea(cv2.convexHull(c)) + 1e-9
-                blob = ObjectBlob(
+                blobs.append(ObjectBlob(
                     contour=c,
                     area_px=float(area),
                     rect=cv2.minAreaRect(c),
                     bbox=(x, y, w, h),
                     solidity=float(area / hull_area),
                     touches_border=touches,
-                )
-                # 사진 가장자리에 닿지 않은 윤곽을 우선하고, 그다음 큰 윤곽을 고릅니다.
-                key = (not touches, area)
-                if best_key is None or key > best_key:
-                    best, best_key = blob, key
+                ))
+        return blobs
+
+
+    # ------------------------------------------------------------------ #
+    # 탭 + GrabCut: 사용자가 누른 점을 기준으로 물건만 오려냅니다.
+    # ------------------------------------------------------------------ #
+    GRABCUT_MAX_SIDE = 800  # 속도를 위해 이 크기로 줄여서 계산합니다.
+
+    def segment_seed(
+        self,
+        canvas_bgr: np.ndarray,
+        px_per_cm: float,
+        marker_poly: np.ndarray,
+        seed_xy: Tuple[float, float],
+        roi_poly: Optional[np.ndarray] = None,
+        rounds: int = 3,
+    ) -> Optional[ObjectBlob]:
+        """seed_xy(캔버스 좌표)를 '확실한 물건'으로 두고 GrabCut으로 물건 영역을 찾습니다.
+
+        1차: 사진 전체를 '아마 배경'으로 두고 탭한 점 주변만 '확실한 물건'으로 표시.
+        2차 이후: 1차 결과를 '아마 물건'으로, 그 주변 사각형만 후보로 두고 다시 계산해
+                  무늬가 많은 물건(바코드, 로고)도 한 덩어리로 잡히게 합니다.
+        """
+        ch, cw = canvas_bgr.shape[:2]
+        scale = min(1.0, self.GRABCUT_MAX_SIDE / max(ch, cw))
+        img = cv2.resize(canvas_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else canvas_bgr
+        h, w = img.shape[:2]
+        ppc = px_per_cm * scale
+        sx, sy = int(round(seed_xy[0] * scale)), int(round(seed_xy[1] * scale))
+        if not (0 <= sx < w and 0 <= sy < h):
+            return None
+
+        ref = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(ref, [np.round(marker_poly * scale).astype(np.int32)], 255)
+        ref = cv2.dilate(ref, np.ones((5, 5), np.uint8))
+        if ref[sy, sx]:
+            return None  # 기준 물체(마커/카드)를 누른 경우
+        roi = None
+        if roi_poly is not None:
+            roi = np.zeros((h, w), np.uint8)
+            cv2.fillPoly(roi, [np.round(roi_poly * scale).astype(np.int32)], 255)
+
+        seed_r = max(2, int(0.5 * ppc))
+
+        def run(mask: np.ndarray) -> Optional[np.ndarray]:
+            cv2.circle(mask, (sx, sy), seed_r, cv2.GC_FGD, -1)
+            mask[ref > 0] = cv2.GC_BGD
+            if roi is not None:
+                mask[roi == 0] = cv2.GC_BGD
+            bgd = np.zeros((1, 65), np.float64)
+            fgd = np.zeros((1, 65), np.float64)
+            try:
+                cv2.grabCut(img, mask, None, bgd, fgd, 4, cv2.GC_INIT_WITH_MASK)
+            except cv2.error:
+                return None
+            fg = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+            fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+            fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+            _, lab = cv2.connectedComponents(fg)
+            if lab[sy, sx] == 0:
+                return None
+            comp = (lab == lab[sy, sx]).astype(np.uint8) * 255
+            # 구멍 채우기
+            cs, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            comp = np.zeros_like(comp)
+            cv2.drawContours(comp, [max(cs, key=cv2.contourArea)], -1, 255, cv2.FILLED)
+            # 얇게 튀어나온 부분(그림자·배경 줄기) 제거
+            k = max(3, int(0.5 * ppc)) | 1
+            opened = cv2.morphologyEx(comp, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+            cs2, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if cs2:
+                inside = [q for q in cs2 if cv2.pointPolygonTest(q, (float(sx), float(sy)), False) >= 0]
+                comp = np.zeros_like(comp)
+                cv2.drawContours(comp, [max(inside or cs2, key=cv2.contourArea)], -1, 255, cv2.FILLED)
+            return comp
+
+        comp = run(np.full((h, w), cv2.GC_PR_BGD, np.uint8))
+        if comp is None:
+            return None
+        area = float(cv2.countNonZero(comp))
+        for _ in range(rounds):
+            x, y, bw, bh = cv2.boundingRect(comp)
+            m = int(0.25 * max(bw, bh) + ppc)
+            mask = np.full((h, w), cv2.GC_BGD, np.uint8)
+            mask[max(0, y - m):min(h, y + bh + m), max(0, x - m):min(w, x + bw + m)] = cv2.GC_PR_BGD
+            mask[comp > 0] = cv2.GC_PR_FGD
+            nxt = run(mask)
+            if nxt is None:
+                break
+            new_area = float(cv2.countNonZero(nxt))
+            comp = nxt
+            if abs(new_area - area) < 0.01 * area:
+                break
+            area = new_area
+
+        cs, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        c = max(cs, key=cv2.contourArea)
+        if cv2.contourArea(c) < self.min_area_cm2 * ppc * ppc:
+            return None
+        # 원래 캔버스 좌표로 되돌립니다.
+        c = np.round(c.astype(np.float64) / scale).astype(np.int32)
+        area_px = float(cv2.contourArea(c))
+        hull_area = cv2.contourArea(cv2.convexHull(c)) + 1e-9
+        x, y, bw, bh = cv2.boundingRect(c)
+        touches = x <= 1 or y <= 1 or x + bw >= cw - 1 or y + bh >= ch - 1
+        gc_blob = ObjectBlob(
+            contour=c,
+            area_px=area_px,
+            rect=cv2.minAreaRect(c),
+            bbox=(x, y, bw, bh),
+            solidity=float(area_px / hull_area),
+            touches_border=bool(touches),
+        )
+
+        # 보완: 무늬가 많은 물건은 GrabCut이 일부만 잡을 수 있습니다.
+        # 탭한 점을 포함하고, GrabCut 결과를 거의 다 덮으며, 너무 크지 않은 Otsu 윤곽이 있으면 그것을 씁니다.
+        exclude, roi_mask, edge_band = self._masks(canvas_bgr.shape, marker_poly, roi_poly)
+        gc_mask = np.zeros((ch, cw), np.uint8)
+        cv2.drawContours(gc_mask, [c], -1, 255, cv2.FILLED)
+        best = gc_blob
+        for blob in self._otsu_blobs(canvas_bgr, px_per_cm, exclude, roi_mask, edge_band):
+            if blob.touches_border or blob.area_px <= best.area_px:
+                continue
+            if blob.area_px > 8.0 * area_px:
+                continue
+            if cv2.pointPolygonTest(blob.contour, (float(seed_xy[0]), float(seed_xy[1])), False) < 0:
+                continue
+            om = np.zeros((ch, cw), np.uint8)
+            cv2.drawContours(om, [blob.contour], -1, 255, cv2.FILLED)
+            covered = cv2.countNonZero(cv2.bitwise_and(om, gc_mask)) / max(area_px, 1.0)
+            if covered >= 0.9:
+                best = blob
         return best
 
 
@@ -600,10 +739,12 @@ class ObjectMeasurer:
         roi: Optional[Tuple[float, float, float, float]] = None,
         reference: str = REF_MARKER,
         card_roi: Optional[Tuple[float, float, float, float]] = None,
+        seed: Optional[Tuple[float, float]] = None,
     ) -> PhotoMeasurement:
         """상면 사진에서 가로(긴 변)와 깊이(짧은 변)를 측정합니다.
-        reference="card"이면 마커 대신 체크카드를 기준으로 씁니다(marker_cm 무시)."""
-        return self._measure(image_bgr, marker_cm, marker_id, roi, "top", reference, card_roi)
+        reference="card"이면 마커 대신 체크카드를 기준으로 씁니다(marker_cm 무시).
+        seed=(x, y)는 사용자가 물건을 탭한 위치(사진 기준 0~1 비율)이며, 주면 GrabCut으로 분할합니다."""
+        return self._measure(image_bgr, marker_cm, marker_id, roi, "top", reference, card_roi, seed)
 
     def measure_side(
         self,
@@ -613,9 +754,10 @@ class ObjectMeasurer:
         roi: Optional[Tuple[float, float, float, float]] = None,
         reference: str = REF_MARKER,
         card_roi: Optional[Tuple[float, float, float, float]] = None,
+        seed: Optional[Tuple[float, float]] = None,
     ) -> PhotoMeasurement:
         """측면 사진에서 높이를 측정합니다. 마커(또는 카드)는 똑바로 세워져 있어야 합니다."""
-        return self._measure(image_bgr, marker_cm, marker_id, roi, "side", reference, card_roi)
+        return self._measure(image_bgr, marker_cm, marker_id, roi, "side", reference, card_roi, seed)
 
     def _find_reference(self, image_bgr, marker_cm, marker_id, reference, card_roi, warnings):
         """기준 물체를 찾아 (검출 결과, 긴 변 cm, 짧은 변 cm) 또는 실패 결과를 돌려줍니다."""
@@ -633,13 +775,14 @@ class ObjectMeasurer:
     def _measure(self, image_bgr: np.ndarray, marker_cm: float, marker_id: Optional[int],
                  roi: Optional[Tuple[float, float, float, float]], view: str,
                  reference: str = REF_MARKER,
-                 card_roi: Optional[Tuple[float, float, float, float]] = None) -> PhotoMeasurement:
+                 card_roi: Optional[Tuple[float, float, float, float]] = None,
+                 seed: Optional[Tuple[float, float]] = None) -> PhotoMeasurement:
         warnings: List[str] = []
         found = self._find_reference(image_bgr, marker_cm, marker_id, reference, card_roi, warnings)
         if isinstance(found, PhotoMeasurement):
             return found
         marker, ref_w_cm, ref_h_cm = found
-        return self._measure_with(image_bgr, marker, ref_w_cm, ref_h_cm, roi, view, reference, warnings)
+        return self._measure_with(image_bgr, marker, ref_w_cm, ref_h_cm, roi, view, reference, warnings, seed)
 
     def _find_marker(self, image_bgr, marker_cm, marker_id, warnings):
         all_markers = self.detector.detect(image_bgr)
@@ -656,7 +799,7 @@ class ObjectMeasurer:
             warnings.append("마커가 여러 개 보여 가장 큰 마커를 기준으로 사용했습니다.")
         return marker, marker_cm, marker_cm
 
-    def _measure_with(self, image_bgr, marker, ref_w_cm, ref_h_cm, roi, view, reference, warnings):
+    def _measure_with(self, image_bgr, marker, ref_w_cm, ref_h_cm, roi, view, reference, warnings, seed=None):
         ref_name = "카드" if reference == REF_CARD else "마커"
         if marker.side_px < MIN_MARKER_PX:
             return PhotoMeasurement.failed(
@@ -671,7 +814,20 @@ class ObjectMeasurer:
 
         canvas = rectifier.warp(image_bgr)
         roi_poly = rectifier.map_points(roi_to_corners(roi, image_bgr.shape)) if roi else None
-        blob = self.segmenter.segment(canvas, rectifier.px_per_cm, rectifier.marker_poly_canvas, roi_poly)
+        blob = None
+        used_seed = False
+        if seed is not None:
+            ih, iw = image_bgr.shape[:2]
+            seed_canvas = rectifier.map_points(np.array([[seed[0] * iw, seed[1] * ih]], np.float64))[0]
+            blob = self.segmenter.segment_seed(canvas, rectifier.px_per_cm, rectifier.marker_poly_canvas,
+                                               (float(seed_canvas[0]), float(seed_canvas[1])), roi_poly)
+            if blob is None:
+                warnings.append("탭한 위치에서 물건을 찾지 못해 자동 인식으로 측정했습니다. "
+                                f"{ref_name}가 아닌 물건 위를 눌렀는지 확인하세요.")
+            else:
+                used_seed = True
+        if blob is None:
+            blob = self.segmenter.segment(canvas, rectifier.px_per_cm, rectifier.marker_poly_canvas, roi_poly)
         if blob is None:
             return PhotoMeasurement.failed(
                 "물체 윤곽을 찾지 못했습니다. 물체와 배경의 밝기 차이를 크게 하거나, "
@@ -703,7 +859,7 @@ class ObjectMeasurer:
         if blob.touches_border:
             blob_conf *= 0.5
             warnings.append("물건이 사진 가장자리에 닿아 있습니다. 물건 전체가 보이도록 다시 찍어 주세요.")
-        if blob.solidity < 0.85:
+        if blob.solidity < (0.8 if used_seed else 0.85):
             blob_conf *= 0.75
             warnings.append("물건 윤곽이 불규칙합니다. 그림자가 섞였을 수 있습니다.")
 
@@ -713,6 +869,10 @@ class ObjectMeasurer:
             warnings.append("체크카드 기준 측정입니다. 더 정확하게 재려면 ArUco 마커 모드를 사용하세요.")
         confidence = round(marker_conf * quality * blob_conf * ref_conf, 2)
         preview = self._preview(canvas, marker, rectifier, blob)
+        if used_seed:
+            sc = tuple(int(v) for v in seed_canvas)
+            cv2.circle(preview, sc, max(6, int(0.3 * ppc)), (0, 255, 255), -1)
+            cv2.circle(preview, sc, max(6, int(0.3 * ppc)), (0, 0, 0), 2)
         return PhotoMeasurement(
             ok=True,
             dims_cm=dims,

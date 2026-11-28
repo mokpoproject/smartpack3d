@@ -64,3 +64,24 @@ def test_card_not_found_gives_error():
     img = np.full((H, W, 3), 235, np.uint8)
     r = ObjectMeasurer().measure_top(img, reference=REF_CARD)
     assert not r.ok and "체크카드" in r.error
+
+
+def _distractor_scene():
+    """큰 어두운 배경 물체(노트북 화면 같은)가 있어 자동 인식이 헷갈리는 장면."""
+    img = _scene("marker")
+    cv2.rectangle(img, (1300, 200), (1300 + 25 * PX // 1, 200 + 40 * PX), (40, 40, 40), -1)  # 큰 어두운 물체(가장자리 닿음)
+    cv2.rectangle(img, (150, 1000), (150 + 20 * PX, 1000 + 16 * PX), (60, 50, 50), -1)   # 20 x 16 cm 다른 물건
+    return img
+
+
+def test_tap_grabcut_picks_tapped_object():
+    img = _distractor_scene()
+    seed = ((900 + 6 * PX) / W, (500 + 4 * PX) / H)  # 12 x 8 cm 물건 가운데를 탭
+    assert _err(ObjectMeasurer().measure_top(img, seed=seed)) <= 0.4
+
+
+def test_tap_on_marker_falls_back_with_warning():
+    img = _scene("marker")
+    seed = ((640 + 3 * PX) / W, (560 + 3 * PX) / H)  # 마커를 잘못 탭
+    r = ObjectMeasurer().measure_top(img, seed=seed)
+    assert r.ok and any("탭한 위치" in w for w in r.warnings)

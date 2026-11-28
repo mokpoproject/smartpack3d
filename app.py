@@ -6,7 +6,7 @@ app.py - SmartPack 3D Streamlit UI (표현 계층)
 
 구성:
 - 탭 1: 물건 입력 표 (기존 기능 유지)
-- 탭 2: 사진으로 크기 추정 (ArUco 마커 기준, 상면/측면 사진, LLM 보조 판정)
+- 탭 2: 사진으로 크기 추정 (마커/체크카드 기준, 가이드 카메라, 물건 탭 + GrabCut, LLM 보조 판정)
 - 탭 3: 3D 자동 배치 결과 (기존 기능 유지)
 
 업무 로직은 packing.py / vision.py / llm_service.py / plot3d.py에 있고,
@@ -29,6 +29,7 @@ from packing import (
     COLORS, ORIENT_FREE, ORIENT_OPTIONS, ORIENT_UPRIGHT,
     Bin, Item, Packer, limit_text, volume,
 )
+from photo_helper import guide_camera, tap_image
 from plot3d import make_figure
 from vision import (
     ARUCO_DICTS, CARD_H_CM, CARD_W_CM, DEFAULT_MARKER_CM, REF_CARD, REF_MARKER,
@@ -159,15 +160,49 @@ with tab_items:
 # =========================================================================== #
 # 탭 2: 사진으로 크기 추정
 # =========================================================================== #
-def photo_input(label: str, key: str) -> Optional[bytes]:
-    """사진 업로드 또는 카메라 촬영 입력. 모바일에서도 쓸 수 있도록 두 방식을 모두 제공합니다."""
+PHOTO_UPLOAD = "사진 올리기"
+PHOTO_GUIDE = "가이드 카메라"
+PHOTO_BASIC = "기본 카메라"
+
+
+class PhotoInput:
+    """사진 한 장에 대한 입력 묶음: 사진, 물건 탭 위치, (가이드 카메라의) 기준 칸 위치."""
+
+    def __init__(self, data: Optional[bytes] = None, seed=None, ref_roi=None) -> None:
+        self.data = data
+        self.seed = seed
+        self.ref_roi = ref_roi
+
+
+def photo_input(label: str, key: str, reference: str) -> PhotoInput:
+    """사진 입력: 올리기 / 가이드 카메라 / 기본 카메라 중 선택하고, 물건을 한 번 탭하게 합니다."""
     st.markdown(f"**{label}**")
-    if st.toggle("카메라로 찍기", key=f"{key}_cam"):
-        shot = st.camera_input(label, key=f"{key}_camera", label_visibility="collapsed")
-        return shot.getvalue() if shot is not None else None
-    up = st.file_uploader(label, type=["jpg", "jpeg", "png"], key=f"{key}_upload",
-                          label_visibility="collapsed")
-    return up.getvalue() if up is not None else None
+    how = st.radio("사진 입력 방법", [PHOTO_UPLOAD, PHOTO_GUIDE, PHOTO_BASIC], horizontal=True,
+                   key=f"{key}_how", label_visibility="collapsed")
+
+    if how == PHOTO_GUIDE:
+        st.caption("휴대폰에서는 https 주소(예: Streamlit Cloud)로 접속해야 카메라가 켜집니다. PC는 localhost에서 바로 됩니다.")
+        shot = guide_camera(reference, key=f"{key}_guide")
+        return PhotoInput(shot.image_bytes, shot.seed, shot.ref_roi if reference == REF_CARD else None)
+
+    data: Optional[bytes] = None
+    if how == PHOTO_BASIC:
+        cam = st.camera_input(label, key=f"{key}_camera", label_visibility="collapsed")
+        data = cam.getvalue() if cam is not None else None
+    else:
+        up = st.file_uploader(label, type=["jpg", "jpeg", "png"], key=f"{key}_upload",
+                              label_visibility="collapsed")
+        data = up.getvalue() if up is not None else None
+    if data is None:
+        return PhotoInput()
+
+    seed = None
+    if st.toggle("👆 물건을 탭해서 지정 (추천)", value=True, key=f"{key}_tap_on",
+                 help="사진에서 물건을 한 번 누르면 그 점을 기준으로 색과 경계를 따라 물건만 오려냅니다(GrabCut)."):
+        seed = tap_image(data, key=f"{key}_tap_{hash(data) & 0xFFFFFFFF:x}")
+        if seed is None:
+            st.caption("아직 탭하지 않았습니다. 탭하지 않으면 자동 인식으로 측정합니다.")
+    return PhotoInput(data, seed)
 
 
 def roi_input(key: str, label: str = "물건 영역 직접 지정 (배경이 복잡할 때)") -> Optional[Tuple[float, float, float, float]]:
@@ -183,6 +218,7 @@ def roi_input(key: str, label: str = "물건 영역 직접 지정 (배경이 복
 def measure_photo(measurer: ObjectMeasurer, data: bytes, marker_cm: float, view: str,
                   roi: Optional[Tuple[float, float, float, float]], reference: str = REF_MARKER,
                   card_roi: Optional[Tuple[float, float, float, float]] = None,
+                  seed: Optional[Tuple[float, float]] = None,
                   ) -> Tuple[PhotoMeasurement, Optional[np.ndarray]]:
     """사진 bytes를 디코딩해 측정합니다. 디코딩 오류도 실패 결과로 바꿉니다."""
     try:
@@ -190,22 +226,26 @@ def measure_photo(measurer: ObjectMeasurer, data: bytes, marker_cm: float, view:
     except ValueError as e:
         return PhotoMeasurement.failed(str(e), reference=reference), None
     if view == "top":
-        return measurer.measure_top(img, marker_cm, roi=roi, reference=reference, card_roi=card_roi), img
-    return measurer.measure_side(img, marker_cm, roi=roi, reference=reference, card_roi=card_roi), img
+        return measurer.measure_top(img, marker_cm, roi=roi, reference=reference, card_roi=card_roi, seed=seed), img
+    return measurer.measure_side(img, marker_cm, roi=roi, reference=reference, card_roi=card_roi, seed=seed), img
 
 
 def run_estimation(target_idx: int, target_name: str, marker_cm: float, dict_name: str,
-                   top_bytes: Optional[bytes], side_bytes: Optional[bytes],
+                   top: "PhotoInput", side: "PhotoInput",
                    roi_top, roi_side, reference: str = REF_MARKER,
                    card_roi_top=None, card_roi_side=None) -> None:
     """사진 측정 -> 결과 통합 -> LLM 보조 판정을 수행하고 결과를 세션에 저장합니다."""
     measurer = get_measurer(dict_name)
+    top_in, side_in = top, side
     top = side = None
     top_img = None
-    if top_bytes is not None:
-        top, top_img = measure_photo(measurer, top_bytes, marker_cm, "top", roi_top, reference, card_roi_top)
-    if side_bytes is not None:
-        side, _ = measure_photo(measurer, side_bytes, marker_cm, "side", roi_side, reference, card_roi_side)
+    # 카드 영역: 사용자가 직접 지정한 값 > 가이드 카메라의 기준 칸 > 자동
+    if top_in.data is not None:
+        top, top_img = measure_photo(measurer, top_in.data, marker_cm, "top", roi_top, reference,
+                                     card_roi_top or top_in.ref_roi, top_in.seed)
+    if side_in.data is not None:
+        side, _ = measure_photo(measurer, side_in.data, marker_cm, "side", roi_side, reference,
+                                card_roi_side or side_in.ref_roi, side_in.seed)
 
     est: ItemEstimate = SizeEstimator().combine(top, side) if top is not None else ItemEstimate(
         errors=["가로·깊이 측정 사진(상면)을 업로드해 주세요."])
@@ -376,23 +416,23 @@ with tab_photo:
 
         card_roi_top = card_roi_side = None
         with st.expander("① 상면 사진 (가로·깊이) - 필수", expanded=True):
-            top_bytes = photo_input("상면 사진", "top")
+            top_in = photo_input("상면 사진", "top", reference)
             roi_top = roi_input("top")
             if reference == REF_CARD:
                 card_roi_top = roi_input("top_card", "카드 영역 직접 지정 (카드를 못 찾을 때)")
         with st.expander("② 측면 사진 (높이) - 선택", expanded=False):
-            side_bytes = photo_input("측면 사진", "side")
+            side_in = photo_input("측면 사진", "side", reference)
             roi_side = roi_input("side")
             if reference == REF_CARD:
                 card_roi_side = roi_input("side_card", "카드 영역 직접 지정 (카드를 못 찾을 때)")
 
         if st.button("✨ AI 크기 추정", type="primary", width="stretch"):
-            if top_bytes is None:
+            if top_in.data is None:
                 st.error("상면 사진을 먼저 올려 주세요.")
             else:
                 with st.spinner(f"{ref_word} 기준으로 측정하는 중..."):
                     run_estimation(target_idx, str(rows.iloc[target_idx][COL_NAME]), marker_cm, dict_name,
-                                   top_bytes, side_bytes, roi_top, roi_side, reference,
+                                   top_in, side_in, roi_top, roi_side, reference,
                                    card_roi_top, card_roi_side)
 
         if st.session_state.apply_msg:
