@@ -1,0 +1,6 @@
+﻿[server]
+headless = true
+port = 8501
+enableCORS = false
+[browser]
+show_msg_on_open = false
