@@ -1,6 +1,9 @@
-﻿[server]
+﻿$content = @"
+[server]
 headless = true
-port = 8501
+port = 8502
 enableCORS = false
 [browser]
 show_msg_on_open = false
+"@
+$content | Out-File -Encoding utf8 .streamlit/config.toml
