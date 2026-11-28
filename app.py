@@ -1,15 +1,8 @@
 
 import streamlit as st
 
-from .packing_core import (
-    Item,
-    pack_items,
-    make_figure,
-    volume,
-    COLORS,
-    ORIENT_OPTIONS,
-    ORIENT_FREE
-)
+from packing_core import Item, pack_items, make_figure, volume, COLORS, ORIENT_OPTIONS, ORIENT_FREE
+
 
 # 페이지 설정
 st.set_page_config(
