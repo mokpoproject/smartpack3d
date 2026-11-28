@@ -53,9 +53,10 @@ def _decode_data_url(url) -> Optional[bytes]:
         return None
 
 
-def guide_camera(reference: str, key: str) -> GuideShot:
-    """가이드 네모 카메라를 보여 주고 (사진, 탭 위치, 기준 칸 위치)를 돌려줍니다."""
-    v = _component(mode="camera", reference=reference, key=key, default=None)
+def guide_camera(reference: str, key: str, layout: str = "beside") -> GuideShot:
+    """가이드 네모 카메라를 보여 주고 (사진, 탭 위치, 기준 칸 위치)를 돌려줍니다.
+    layout="beside": 기준 칸이 물건 칸 왼쪽 / layout="face": 기준 칸이 물건 앞면 칸 가운데."""
+    v = _component(mode="camera", reference=reference, layout=layout, key=key, default=None)
     if not isinstance(v, dict):
         return GuideShot(None, None, None)
     return GuideShot(_decode_data_url(v.get("image")), _norm(v.get("seed"), 2), _norm(v.get("ref_roi"), 4))

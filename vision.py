@@ -599,12 +599,14 @@ class ObjectSegmenter:
         seed_xy: Tuple[float, float],
         roi_poly: Optional[np.ndarray] = None,
         rounds: int = 3,
+        ref_inside: bool = False,
     ) -> Optional[ObjectBlob]:
         """seed_xy(캔버스 좌표)를 '확실한 물건'으로 두고 GrabCut으로 물건 영역을 찾습니다.
 
         1차: 사진 전체를 '아마 배경'으로 두고 탭한 점 주변만 '확실한 물건'으로 표시.
         2차 이후: 1차 결과를 '아마 물건'으로, 그 주변 사각형만 후보로 두고 다시 계산해
                   무늬가 많은 물건(바코드, 로고)도 한 덩어리로 잡히게 합니다.
+        ref_inside=True: 기준 카드/마커가 물건 앞면에 붙어 있는 경우. 기준 영역을 '확실한 물건'으로 둡니다.
         """
         ch, cw = canvas_bgr.shape[:2]
         scale = min(1.0, self.GRABCUT_MAX_SIDE / max(ch, cw))
@@ -618,7 +620,7 @@ class ObjectSegmenter:
         ref = np.zeros((h, w), np.uint8)
         cv2.fillPoly(ref, [np.round(marker_poly * scale).astype(np.int32)], 255)
         ref = cv2.dilate(ref, np.ones((5, 5), np.uint8))
-        if ref[sy, sx]:
+        if ref[sy, sx] and not ref_inside:
             return None  # 기준 물체(마커/카드)를 누른 경우
         roi = None
         if roi_poly is not None:
@@ -629,7 +631,7 @@ class ObjectSegmenter:
 
         def run(mask: np.ndarray) -> Optional[np.ndarray]:
             cv2.circle(mask, (sx, sy), seed_r, cv2.GC_FGD, -1)
-            mask[ref > 0] = cv2.GC_BGD
+            mask[ref > 0] = cv2.GC_FGD if ref_inside else cv2.GC_BGD
             if roi is not None:
                 mask[roi == 0] = cv2.GC_BGD
             bgd = np.zeros((1, 65), np.float64)
@@ -639,6 +641,8 @@ class ObjectSegmenter:
             except cv2.error:
                 return None
             fg = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+            if ref_inside:
+                fg[ref > 0] = 255
             fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
             fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
             _, lab = cv2.connectedComponents(fg)
@@ -697,6 +701,8 @@ class ObjectSegmenter:
             touches_border=bool(touches),
         )
 
+        if ref_inside:
+            return gc_blob
         # 보완: 무늬가 많은 물건은 GrabCut이 일부만 잡을 수 있습니다.
         # 탭한 점을 포함하고, GrabCut 결과를 거의 다 덮으며, 너무 크지 않은 Otsu 윤곽이 있으면 그것을 씁니다.
         exclude, roi_mask, edge_band = self._masks(canvas_bgr.shape, marker_poly, roi_poly)
@@ -755,9 +761,14 @@ class ObjectMeasurer:
         reference: str = REF_MARKER,
         card_roi: Optional[Tuple[float, float, float, float]] = None,
         seed: Optional[Tuple[float, float]] = None,
+        ref_on_object: bool = False,
     ) -> PhotoMeasurement:
-        """측면 사진에서 높이를 측정합니다. 마커(또는 카드)는 똑바로 세워져 있어야 합니다."""
-        return self._measure(image_bgr, marker_cm, marker_id, roi, "side", reference, card_roi, seed)
+        """측면 사진에서 높이를 측정합니다.
+        ref_on_object=False: 기준(마커/카드)을 물건 옆에 똑바로 세워 찍은 사진.
+        ref_on_object=True : 기준을 물건 앞면에 평평하게 대고 정면에서 찍은 사진(추천, 더 정확).
+                             이때는 탭하지 않아도 기준 위치에서 물건을 찾아 갑니다."""
+        return self._measure(image_bgr, marker_cm, marker_id, roi, "side_face" if ref_on_object else "side",
+                             reference, card_roi, seed)
 
     def _find_reference(self, image_bgr, marker_cm, marker_id, reference, card_roi, warnings):
         """기준 물체를 찾아 (검출 결과, 긴 변 cm, 짧은 변 cm) 또는 실패 결과를 돌려줍니다."""
@@ -816,7 +827,25 @@ class ObjectMeasurer:
         roi_poly = rectifier.map_points(roi_to_corners(roi, image_bgr.shape)) if roi else None
         blob = None
         used_seed = False
-        if seed is not None:
+        face = view == "side_face"
+        if face:
+            # 기준이 물건 앞면에 붙어 있으므로, 탭이 없으면 기준 중심을 물건 위치로 씁니다.
+            ih, iw = image_bgr.shape[:2]
+            if seed is not None:
+                seed_canvas = rectifier.map_points(np.array([[seed[0] * iw, seed[1] * ih]], np.float64))[0]
+            else:
+                seed_canvas = rectifier.marker_poly_canvas.mean(axis=0)
+            blob = self.segmenter.segment_seed(canvas, rectifier.px_per_cm, rectifier.marker_poly_canvas,
+                                               (float(seed_canvas[0]), float(seed_canvas[1])), roi_poly,
+                                               ref_inside=True)
+            used_seed = blob is not None
+            if blob is None:
+                return PhotoMeasurement.failed(
+                    f"{ref_name}가 붙은 물건 면을 찾지 못했습니다. 물건 앞면이 사진 가운데에 크게 나오게, "
+                    f"{ref_name}는 앞면 안쪽에 평평하게 대고 다시 찍어 주세요.",
+                    marker_found=True, reference=reference,
+                )
+        elif seed is not None:
             ih, iw = image_bgr.shape[:2]
             seed_canvas = rectifier.map_points(np.array([[seed[0] * iw, seed[1] * ih]], np.float64))[0]
             blob = self.segmenter.segment_seed(canvas, rectifier.px_per_cm, rectifier.marker_poly_canvas,
@@ -842,6 +871,33 @@ class ObjectMeasurer:
             long_cm, short_cm = max(rw, rh) / ppc, min(rw, rh) / ppc
             dims = {"width": round(long_cm, 1), "depth": round(short_cm, 1)}
             warnings.append("물건 높이가 있으면 위에서 본 크기가 실제보다 크게 나올 수 있습니다. 카메라를 물건 위에 수직으로 두세요.")
+        elif face:
+            # 사진의 '위쪽' 방향을 보정 평면으로 옮겨, 그 방향에 가까운 물건 변의 길이를 높이로 씁니다.
+            # (카드를 가로/세로 어느 방향으로 대도 됩니다.)
+            ih, iw = image_bgr.shape[:2]
+            c_img = np.asarray(marker.corners, np.float64).mean(axis=0)
+            step = max(10.0, marker.side_px * 0.5)
+            up_pts = rectifier.map_points(np.array([c_img, c_img - [0.0, step]]))
+            up = up_pts[1] - up_pts[0]
+            up /= (np.linalg.norm(up) + 1e-9)
+            box = cv2.boxPoints(blob.rect)
+            e1, e2 = box[1] - box[0], box[2] - box[1]
+            l1, l2 = float(np.linalg.norm(e1)), float(np.linalg.norm(e2))
+            a1 = abs(float(np.dot(e1 / (l1 + 1e-9), up)))
+            a2 = abs(float(np.dot(e2 / (l2 + 1e-9), up)))
+            height_px, width_px = (l1, l2) if a1 >= a2 else (l2, l1)
+            dims = {"height": round(height_px / ppc, 1)}
+            warnings.append(f"{ref_name}가 물건 앞면에 평평하게 닿아 있다고 가정합니다. "
+                            f"(참고: 앞면 가로 약 {width_px / ppc:.1f}cm)")
+            # 기준이 물건 밖으로 삐져나오면 경계가 기준 테두리로 잘못 잡힐 수 있습니다.
+            ref_mask = np.zeros(canvas.shape[:2], np.uint8)
+            cv2.fillPoly(ref_mask, [np.round(rectifier.marker_poly_canvas).astype(np.int32)], 255)
+            obj_mask = np.zeros(canvas.shape[:2], np.uint8)
+            cv2.drawContours(obj_mask, [blob.contour], -1, 255, cv2.FILLED)
+            inner = cv2.erode(obj_mask, np.ones((5, 5), np.uint8))
+            if cv2.countNonZero(cv2.bitwise_and(ref_mask, cv2.bitwise_not(inner))) > 0.02 * cv2.countNonZero(ref_mask):
+                warnings.append(f"{ref_name}가 물건 면 가장자리에 걸쳐 있습니다. 물건 높이가 {ref_name}보다 낮으면 "
+                                f"{ref_name}를 세로로 돌리거나 측면 촬영 방법을 '옆에 세우기'로 바꿔 보세요.")
         else:
             _, _, _, bh = blob.bbox
             dims = {"height": round(bh / ppc, 1)}

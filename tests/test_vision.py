@@ -85,3 +85,46 @@ def test_tap_on_marker_falls_back_with_warning():
     seed = ((640 + 3 * PX) / W, (560 + 3 * PX) / H)  # 마커를 잘못 탭
     r = ObjectMeasurer().measure_top(img, seed=seed)
     assert r.ok and any("탭한 위치" in w for w in r.warnings)
+
+
+def _face_scene(box_w_cm, box_h_cm, card_vertical=False, tilt=False):
+    """측면 사진: 물건 앞면(어두운 상자)에 밝은 카드를 대고 정면에서 찍은 장면."""
+    img = np.full((H, W, 3), 225, np.uint8)
+    img[1100:] = (170, 175, 180)  # 바닥
+    bw, bh = int(box_w_cm * PX), int(box_h_cm * PX)
+    x0, y1 = 700, 1100
+    cv2.rectangle(img, (x0, y1 - bh), (x0 + bw, y1), (60, 80, 110), -1)
+    card = np.full((int(5.398 * PX) + 40, int(8.56 * PX) + 40, 3), (60, 80, 110), np.uint8)
+    _card(card, 20, 20, color=(235, 235, 240))
+    card = card[20:-20, 20:-20]
+    if card_vertical:
+        card = cv2.rotate(card, cv2.ROTATE_90_CLOCKWISE)
+    ch_, cw_ = card.shape[:2]
+    cx, cy = x0 + bw // 2 - cw_ // 2, y1 - bh // 2 - ch_ // 2
+    img[cy:cy + ch_, cx:cx + cw_] = card
+    if tilt:
+        src = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
+        dst = np.float32([[80, 30], [1950, 0], [W, H], [0, 1470]])
+        img = cv2.warpPerspective(img, cv2.getPerspectiveTransform(src, dst), (W, H), borderValue=(200, 200, 200))
+    return img
+
+
+def _height(r):
+    assert r.ok, r.error
+    return r.dims_cm["height"]
+
+
+def test_face_mode_height_card_horizontal():
+    r = ObjectMeasurer().measure_side(_face_scene(14, 9), reference=REF_CARD, ref_on_object=True)
+    assert abs(_height(r) - 9) <= 0.3
+
+
+def test_face_mode_height_card_vertical_tilted():
+    r = ObjectMeasurer().measure_side(_face_scene(14, 11, card_vertical=True, tilt=True),
+                                      reference=REF_CARD, ref_on_object=True)
+    assert abs(_height(r) - 11) <= 0.5
+
+
+def test_face_mode_low_object_card_near_edge():
+    r = ObjectMeasurer().measure_side(_face_scene(16, 6), reference=REF_CARD, ref_on_object=True)
+    assert abs(_height(r) - 6) <= 0.4

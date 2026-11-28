@@ -73,6 +73,13 @@
   function guideRects(w, h) {
     const isCard = args.reference === "card";
     const aspect = isCard ? 8.56 / 5.398 : 1.0;
+    if (args.layout === "face") {
+      // 물건 앞면 칸을 크게, 기준 칸은 그 가운데에
+      const obj = [0.15, 0.15, 0.85, 0.85];
+      const rw = w * (isCard ? 0.22 : 0.16), rh = rw / aspect;
+      const ref = [(w - rw) / 2 / w, (h - rh) / 2 / h, (w + rw) / 2 / w, (h + rh) / 2 / h];
+      return { ref: ref, obj: obj };
+    }
     const refWpx = w * (isCard ? 0.30 : 0.22);
     const refHpx = refWpx / aspect;
     const refX = w * 0.05, refY = (h - refHpx) / 2;
@@ -101,7 +108,7 @@
                 <text x="${x + 10}" y="${Math.max(0, y - 44) + 29}" font-size="26" fill="${color === "#ffffff" ? "#111" : "#fff"}" font-weight="700">${label}</text>`;
       };
       s += R(g.ref, "#29b5e8", args.reference === "card" ? "카드" : "마커", false);
-      s += R(g.obj, "#ffffff", "물건", true);
+      s += R(g.obj, "#ffffff", args.layout === "face" ? "물건 앞면" : "물건", true);
     }
     if (seed) {
       const cx = seed[0] * w, cy = seed[1] * h;
@@ -135,9 +142,12 @@
       video.classList.remove("hidden"); still.classList.add("hidden");
       btnStart.classList.add("hidden"); btnShoot.classList.remove("hidden"); btnFlip.classList.remove("hidden");
       btnRetake.classList.add("hidden");
-      hint.textContent = args.reference === "card"
-        ? "파란 칸에 카드를, 흰 칸에 물건을 맞추고 위에서 수직으로 찍으세요."
-        : "파란 칸에 마커를, 흰 칸에 물건을 맞추고 찍으세요.";
+      const refWord = args.reference === "card" ? "카드" : "마커";
+      hint.textContent = args.layout === "face"
+        ? `${refWord}를 물건 앞면에 대고, 흰 칸에 앞면 전체가 들어오게 정면에서 찍으세요.`
+        : (args.reference === "card"
+          ? "파란 칸에 카드를, 흰 칸에 물건을 맞추고 위에서 수직으로 찍으세요."
+          : "파란 칸에 마커를, 흰 칸에 물건을 맞추고 찍으세요.");
       drawOverlay(true);
     } catch (e) {
       hint.textContent = "카메라를 켜지 못했습니다 (" + e.name + "). 카메라 권한을 허용했는지 확인하세요. 휴대폰은 https 주소에서만 카메라가 켜집니다.";
@@ -163,9 +173,14 @@
     video.classList.add("hidden"); still.classList.remove("hidden");
     btnShoot.classList.add("hidden"); btnFlip.classList.add("hidden"); btnRetake.classList.remove("hidden");
     // 기본 탭 위치 = 물건 칸 가운데 (사용자가 다시 탭하면 바뀝니다)
-    const g = guideRects(1, imgH / imgW).obj;
-    seed = [(g[0] + g[2]) / 2, (g[1] + g[3]) / 2];
-    hint.textContent = "찍었습니다. 사진에서 물건을 한 번 눌러 주세요 (노란 점 = 물건으로 인식할 위치).";
+    if (args.layout === "face") {
+      seed = null;  // 앞면 모드: 기준 위치에서 물건을 찾으므로 탭은 선택
+      hint.textContent = "찍었습니다. 그대로 추정하면 됩니다 (물건을 눌러 위치를 직접 지정할 수도 있어요).";
+    } else {
+      const g = guideRects(1, imgH / imgW).obj;
+      seed = [(g[0] + g[2]) / 2, (g[1] + g[3]) / 2];
+      hint.textContent = "찍었습니다. 사진에서 물건을 한 번 눌러 주세요 (노란 점 = 물건으로 인식할 위치).";
+    }
     drawOverlay(true);
     emit();
     setTimeout(setHeight, 50);
