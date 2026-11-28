@@ -1,7 +1,7 @@
 
 import streamlit as st
 
-from packing_core import (
+from .packing_core import (
     Item,
     pack_items,
     make_figure,
