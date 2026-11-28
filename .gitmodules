@@ -1,0 +1,3 @@
+[submodule "smartpack3d"]
+	path = smartpack3d
+	url = https://github.com/mokpoproject/smartpack3d.git
